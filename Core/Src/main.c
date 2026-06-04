@@ -45,6 +45,27 @@ typedef struct {
     float    gyro_z_rads;
     float    imu_temp_c;
 } BundleData_t;
+
+/* Binary telemetry packet sent over USART2 to Heltec.
+ * Fixed size = 2 sync + 1 len + 44 payload + 1 crc = 48 bytes.
+ * Heltec parser: wait for 0xAA 0x55, read 46 more bytes, verify CRC. */
+typedef struct __attribute__((packed)) {
+    uint8_t  sync1;         /* 0xAA                          */
+    uint8_t  sync2;         /* 0x55                          */
+    uint8_t  len;           /* payload length = 44           */
+    uint32_t timestamp;     /* ms since boot                 */
+    int32_t  pressure_pa;
+    float    altitude_m;
+    float    accel_x_mss;
+    float    accel_y_mss;
+    float    accel_z_mss;
+    float    gyro_x_rads;
+    float    gyro_y_rads;
+    float    gyro_z_rads;
+    float    imu_temp_c;
+    float    servo_deg;
+    uint8_t  crc;           /* XOR of all payload bytes      */
+} TxPacket_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -78,7 +99,6 @@ UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 volatile BundleData_t liveTelemetry = {0};
-char uartTxBuffer[160];
 
 /* 32-byte aligned: SDMMC IDMA bypasses D-Cache and reads directly from SRAM.
    FatFs's internal sector buffer (fs->win) lives inside SDFatFs — aligning it
@@ -232,23 +252,33 @@ int main(void)
       liveTelemetry.gyro_z_rads = ICM45686_GetGyroZ_rads();
       liveTelemetry.imu_temp_c  = ICM45686_GetTemperature_C();
       
-      int len = snprintf(uartTxBuffer, sizeof(uartTxBuffer),
-                         "%lu,%ld,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.2f\r\n",
-                         liveTelemetry.timestamp,
-                         liveTelemetry.pressure_pa,
-                         liveTelemetry.temperature_c,
-                         liveTelemetry.altitude_m,
-                         (double)liveTelemetry.servo_deg,
-                         (double)liveTelemetry.accel_x_mss,
-                         (double)liveTelemetry.accel_y_mss,
-                         (double)liveTelemetry.accel_z_mss,
-                         (double)liveTelemetry.gyro_x_rads,
-                         (double)liveTelemetry.gyro_y_rads,
-                         (double)liveTelemetry.gyro_z_rads,
-                         (double)liveTelemetry.imu_temp_c);
-         if (len > 0) {
-             HAL_UART_Transmit(&huart2, (uint8_t *)uartTxBuffer, (uint16_t)len, HAL_MAX_DELAY);
-         }
+      /* Build binary telemetry packet — fixed 48 bytes, no snprintf overhead.
+         Timestamp is captured immediately before transmit to minimise drift. */
+      {
+          TxPacket_t pkt;
+          pkt.sync1       = 0xAAU;
+          pkt.sync2       = 0x55U;
+          pkt.len         = 44U;
+          pkt.timestamp   = liveTelemetry.timestamp;
+          pkt.pressure_pa = liveTelemetry.pressure_pa;
+          pkt.altitude_m  = (float)liveTelemetry.altitude_m;
+          pkt.accel_x_mss = liveTelemetry.accel_x_mss;
+          pkt.accel_y_mss = liveTelemetry.accel_y_mss;
+          pkt.accel_z_mss = liveTelemetry.accel_z_mss;
+          pkt.gyro_x_rads = liveTelemetry.gyro_x_rads;
+          pkt.gyro_y_rads = liveTelemetry.gyro_y_rads;
+          pkt.gyro_z_rads = liveTelemetry.gyro_z_rads;
+          pkt.imu_temp_c  = liveTelemetry.imu_temp_c;
+          pkt.servo_deg   = liveTelemetry.servo_deg;
+
+          /* CRC: XOR of every payload byte (after the 3-byte header) */
+          uint8_t crc = 0U;
+          const uint8_t *p = (const uint8_t *)&pkt + 3U; /* skip sync1,sync2,len */
+          for (uint8_t i = 0; i < 44U; i++) { crc ^= p[i]; }
+          pkt.crc = crc;
+
+          HAL_UART_Transmit(&huart2, (uint8_t *)&pkt, sizeof(TxPacket_t), 10);
+      }
 
 
          //sd
