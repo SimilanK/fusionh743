@@ -22,6 +22,14 @@ C_DEPS :=
 
 # Every subdirectory with source files must be described here
 SUBDIRS := \
+.claude/worktrees/unruffled-bhabha-cf975e/Core/Src \
+.claude/worktrees/unruffled-bhabha-cf975e/Drivers/STM32H7xx_HAL_Driver/Src \
+.claude/worktrees/unruffled-bhabha-cf975e/FATFS/App \
+.claude/worktrees/unruffled-bhabha-cf975e/FATFS/Target \
+.claude/worktrees/unruffled-bhabha-cf975e/Middlewares/Third_Party/FatFs/src \
+.claude/worktrees/unruffled-bhabha-cf975e/Middlewares/Third_Party/FatFs/src/option \
+.claude/worktrees/unruffled-bhabha-cf975e/STM32CubeIDE/Application/User/Core \
+.claude/worktrees/unruffled-bhabha-cf975e/STM32CubeIDE/Application/User/Startup \
 Core/Src \
 Drivers/STM32H7xx_HAL_Driver/Src \
 FATFS/App \

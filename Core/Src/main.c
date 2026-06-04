@@ -26,6 +26,7 @@
 #include <string.h>
 #include <math.h>
 #include "MS5607SPI.h"
+#include "ICMSPI.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -36,6 +37,13 @@ typedef struct {
     double   temperature_c;
     double   altitude_m;
     float    servo_deg;
+    float    accel_x_mss;
+    float    accel_y_mss;
+    float    accel_z_mss;
+    float    gyro_x_rads;
+    float    gyro_y_rads;
+    float    gyro_z_rads;
+    float    imu_temp_c;
 } BundleData_t;
 /* USER CODE END PTD */
 
@@ -61,6 +69,8 @@ SD_HandleTypeDef hsd1;
 
 SPI_HandleTypeDef hspi1;
 SPI_HandleTypeDef hspi4;
+DMA_HandleTypeDef hdma_spi4_rx;
+DMA_HandleTypeDef hdma_spi4_tx;
 
 TIM_HandleTypeDef htim2;
 
@@ -68,11 +78,14 @@ UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 volatile BundleData_t liveTelemetry = {0};
-char uartTxBuffer[96];
+char uartTxBuffer[160];
 
-FATFS SDFatFs;
-FIL   LogFile;
-char  sdWriteBuffer[80];
+/* 32-byte aligned: SDMMC IDMA bypasses D-Cache and reads directly from SRAM.
+   FatFs's internal sector buffer (fs->win) lives inside SDFatFs — aligning it
+   ensures SCB_CleanDCache covers the correct cache lines before IDMA reads. */
+__attribute__((aligned(32))) FATFS SDFatFs;
+__attribute__((aligned(32))) FIL   LogFile;
+__attribute__((aligned(32))) char  sdWriteBuffer[160];
 uint8_t sdReady = 0;
 /* USER CODE END PV */
 
@@ -80,6 +93,7 @@ uint8_t sdReady = 0;
 void SystemClock_Config(void);
 static void MPU_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_SPI1_Init(void);
@@ -131,10 +145,11 @@ int main(void)
 
   /* USER CODE BEGIN SysInit */
 
-  /* USER CODE END SysInit */
+  /* USE21q CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART2_UART_Init();
   MX_I2C1_Init();
   MX_SPI1_Init();
@@ -149,22 +164,43 @@ int main(void)
   //baroinit — now on SPI1 (PA5/6/7) with CS on PA4, matching the working G474 setup
   MS5607_Init(&hspi1, BARO_CS_GPIO_Port, BARO_CS_Pin);
 
+  //imu init — SPI4 (PE2/5/6), CS=PE4
+  //NOTE: PE4 must be configured as GPIO_Output in CubeMX if not already done
+  //NOTE: SPI4 must be Mode 3 (CPOL=High, CPHA=2Edge) in CubeMX
+  ICM45686_Init(&hspi4, ICM_CS_GPIO_Port, ICM_CS_Pin);
+
   //UART header
-  const char *uartHeader = "timestamp_ms,pressure_pa,temperature_c,altitude_m,servo_deg\r\n";
+  const char *uartHeader = "timestamp_ms,pressure_pa,temperature_c,altitude_m,servo_deg,"
+                            "ax_mss,ay_mss,az_mss,gx_rads,gy_rads,gz_rads,imu_temp_c\r\n";
   HAL_UART_Transmit(&huart2, (uint8_t *)uartHeader, (uint16_t)strlen(uartHeader), HAL_MAX_DELAY);
 
-  //sd init
-  HAL_Delay(100);
-   if (f_mount(&SDFatFs, "", 1) == FR_OK) {
-       if (f_open(&LogFile, "BUNDLE_LOG.CSV", FA_OPEN_ALWAYS | FA_WRITE | FA_READ) == FR_OK) {
-           f_lseek(&LogFile, f_size(&LogFile));
-           if (f_size(&LogFile) == 0) {
-               const char *hdr = "timestamp_ms,pressure_pa,temperature_c,altitude_m,servo_deg\r\n";
-               UINT bw;
-               f_write(&LogFile, hdr, strlen(hdr), &bw);
-               f_sync(&LogFile);
+  //sd init — 500ms lets SDMMC card finish power-up before f_mount
+  {
+       FRESULT fres;
+       char sdDbg[48];
+       int  dbgLen;
+
+       fres = f_mount(&SDFatFs, "", 1);
+       dbgLen = snprintf(sdDbg, sizeof(sdDbg), "SD mount: %d\r\n", (int)fres);
+       HAL_UART_Transmit(&huart2, (uint8_t *)sdDbg, (uint16_t)dbgLen, HAL_MAX_DELAY);
+
+       if (fres == FR_OK) {
+           fres = f_open(&LogFile, "FLIGHT01.CSV", FA_OPEN_ALWAYS | FA_WRITE | FA_READ);
+           dbgLen = snprintf(sdDbg, sizeof(sdDbg), "SD open: %d\r\n", (int)fres);
+           HAL_UART_Transmit(&huart2, (uint8_t *)sdDbg, (uint16_t)dbgLen, HAL_MAX_DELAY);
+
+           if (fres == FR_OK) {
+               f_lseek(&LogFile, f_size(&LogFile));
+               if (f_size(&LogFile) == 0) {
+                   const char *hdr = "timestamp_ms,pressure_pa,temperature_c,altitude_m,servo_deg,"
+                                      "ax_mss,ay_mss,az_mss,gx_rads,gy_rads,gz_rads,imu_temp_c\r\n";
+                   UINT bw;
+                   f_write(&LogFile, hdr, strlen(hdr), &bw);
+                   f_sync(&LogFile);
+               }
+               sdReady = 1;
+               HAL_UART_Transmit(&huart2, (uint8_t *)"SD ready\r\n", 10, HAL_MAX_DELAY);
            }
-           sdReady = 1;
        }
    }
 
@@ -180,21 +216,36 @@ int main(void)
 
 
 	  //Baro update
-      MS5607Update();\
+      MS5607Update();
       liveTelemetry.timestamp     = HAL_GetTick();
       liveTelemetry.pressure_pa   = MS5607GetPressurePa();
       liveTelemetry.temperature_c = MS5607GetTemperatureC();
       liveTelemetry.altitude_m    = MS5607GetAltitudeM();
+
+      //IMU update
+      ICM45686_Update();
+      liveTelemetry.accel_x_mss = ICM45686_GetAccelX_mss();
+      liveTelemetry.accel_y_mss = ICM45686_GetAccelY_mss();
+      liveTelemetry.accel_z_mss = ICM45686_GetAccelZ_mss();
+      liveTelemetry.gyro_x_rads = ICM45686_GetGyroX_rads();
+      liveTelemetry.gyro_y_rads = ICM45686_GetGyroY_rads();
+      liveTelemetry.gyro_z_rads = ICM45686_GetGyroZ_rads();
+      liveTelemetry.imu_temp_c  = ICM45686_GetTemperature_C();
       
-      //live expression — append raw D1 (pressure ADC) and D2 (temperature ADC) for diagnosis
       int len = snprintf(uartTxBuffer, sizeof(uartTxBuffer),
-                            "%lu,%ld,%.2f,%.2f,%.2f,\r\n",
-                            liveTelemetry.timestamp,
-                            liveTelemetry.pressure_pa,
-                            liveTelemetry.temperature_c,
-                            liveTelemetry.altitude_m,
-                            (double)liveTelemetry.servo_deg
-                            );
+                         "%lu,%ld,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.2f\r\n",
+                         liveTelemetry.timestamp,
+                         liveTelemetry.pressure_pa,
+                         liveTelemetry.temperature_c,
+                         liveTelemetry.altitude_m,
+                         (double)liveTelemetry.servo_deg,
+                         (double)liveTelemetry.accel_x_mss,
+                         (double)liveTelemetry.accel_y_mss,
+                         (double)liveTelemetry.accel_z_mss,
+                         (double)liveTelemetry.gyro_x_rads,
+                         (double)liveTelemetry.gyro_y_rads,
+                         (double)liveTelemetry.gyro_z_rads,
+                         (double)liveTelemetry.imu_temp_c);
          if (len > 0) {
              HAL_UART_Transmit(&huart2, (uint8_t *)uartTxBuffer, (uint16_t)len, HAL_MAX_DELAY);
          }
@@ -204,14 +255,23 @@ int main(void)
          if (sdReady) {
                UINT bw;
                int sdLen = snprintf(sdWriteBuffer, sizeof(sdWriteBuffer),
-                                    "%lu,%ld,%.2f,%.2f,%.2f\r\n",
+                                    "%lu,%ld,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.2f\r\n",
                                     liveTelemetry.timestamp,
                                     liveTelemetry.pressure_pa,
                                     liveTelemetry.temperature_c,
                                     liveTelemetry.altitude_m,
-                                    (double)liveTelemetry.servo_deg);
-               f_write(&LogFile, sdWriteBuffer, (UINT)sdLen, &bw);
-               f_sync(&LogFile);
+                                    (double)liveTelemetry.servo_deg,
+                                    (double)liveTelemetry.accel_x_mss,
+                                    (double)liveTelemetry.accel_y_mss,
+                                    (double)liveTelemetry.accel_z_mss,
+                                    (double)liveTelemetry.gyro_x_rads,
+                                    (double)liveTelemetry.gyro_y_rads,
+                                    (double)liveTelemetry.gyro_z_rads,
+                                    (double)liveTelemetry.imu_temp_c);
+               if (sdLen > 0) {
+                   f_write(&LogFile, sdWriteBuffer, (UINT)sdLen, &bw);
+                   f_sync(&LogFile);
+               }
            }
 
          //servo
@@ -397,7 +457,7 @@ static void MX_SPI1_Init(void)
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256;  /* 192 MHz / 256 = 750 kHz — safe for MS5607 (max 20 MHz) */
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_128;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -442,8 +502,8 @@ static void MX_SPI4_Init(void)
   hspi4.Init.Mode = SPI_MODE_MASTER;
   hspi4.Init.Direction = SPI_DIRECTION_2LINES;
   hspi4.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi4.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi4.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi4.Init.CLKPolarity = SPI_POLARITY_HIGH;
+  hspi4.Init.CLKPhase = SPI_PHASE_2EDGE;
   hspi4.Init.NSS = SPI_NSS_SOFT;
   hspi4.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_64;
   hspi4.Init.FirstBit = SPI_FIRSTBIT_MSB;
@@ -578,6 +638,25 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA2_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+  /* DMA2_Stream1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream1_IRQn, 6, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream1_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -591,14 +670,30 @@ static void MX_GPIO_Init(void)
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOE_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(ICM_CS_GPIO_Port, ICM_CS_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(BARO_CS_GPIO_Port, BARO_CS_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin : ICM_CS_Pin */
+  GPIO_InitStruct.Pin = ICM_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(ICM_CS_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : ICM_INT1_Pin */
+  GPIO_InitStruct.Pin = ICM_INT1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(ICM_INT1_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : BARO_CS_Pin */
   GPIO_InitStruct.Pin = BARO_CS_Pin;
@@ -613,15 +708,9 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(SD_DETECT_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : INT1_Pin */
-  GPIO_InitStruct.Pin = INT1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  HAL_GPIO_Init(INT1_GPIO_Port, &GPIO_InitStruct);
-
   /* EXTI interrupt init*/
-  HAL_NVIC_SetPriority(INT1_EXTI_IRQn, 5, 0);
-  HAL_NVIC_EnableIRQ(INT1_EXTI_IRQn);
+  HAL_NVIC_SetPriority(ICM_INT1_EXTI_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(ICM_INT1_EXTI_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 

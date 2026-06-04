@@ -171,6 +171,13 @@
   * @param  None
   * @retval None
   */
+/* Called by startup assembly before SystemInit.
+   Power supply (LDO) is fully configured later by HAL_PWREx_ConfigSupply()
+   in SystemClock_Config, so nothing needs to happen here. */
+void ExitRun0Mode(void)
+{
+}
+
 void SystemInit (void)
 {
 #if defined (DATA_IN_D2_SRAM)

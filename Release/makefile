@@ -17,6 +17,14 @@ RM := rm -rf
 -include FATFS/App/subdir.mk
 -include Drivers/STM32H7xx_HAL_Driver/Src/subdir.mk
 -include Core/Src/subdir.mk
+-include .claude/worktrees/unruffled-bhabha-cf975e/STM32CubeIDE/Application/User/Startup/subdir.mk
+-include .claude/worktrees/unruffled-bhabha-cf975e/STM32CubeIDE/Application/User/Core/subdir.mk
+-include .claude/worktrees/unruffled-bhabha-cf975e/Middlewares/Third_Party/FatFs/src/option/subdir.mk
+-include .claude/worktrees/unruffled-bhabha-cf975e/Middlewares/Third_Party/FatFs/src/subdir.mk
+-include .claude/worktrees/unruffled-bhabha-cf975e/FATFS/Target/subdir.mk
+-include .claude/worktrees/unruffled-bhabha-cf975e/FATFS/App/subdir.mk
+-include .claude/worktrees/unruffled-bhabha-cf975e/Drivers/STM32H7xx_HAL_Driver/Src/subdir.mk
+-include .claude/worktrees/unruffled-bhabha-cf975e/Core/Src/subdir.mk
 -include objects.mk
 
 ifneq ($(MAKECMDGOALS),clean)

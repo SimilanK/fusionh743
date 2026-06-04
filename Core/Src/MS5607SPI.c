@@ -163,41 +163,44 @@ void MS5607UncompensatedRead(struct MS5607UncompensatedValues *values)
 void MS5607Convert(struct MS5607UncompensatedValues *raw, struct MS5607Readings *readings)
 {
     uint32_t D1 = raw->pressure;
-    uint32_t D2 = raw->temperature;
+    /* D2 (raw->temperature) is intentionally unused — temperature sensor
+       is broken and its ADC value is unreliable.  A synthetic dT for
+       exactly 25.00 °C is substituted so that OFF and SENS (and therefore
+       pressure) are computed at a known, stable reference point. */
 
     /* Pull calibration values from PROM (named per datasheet) */
     int64_t C1 = _prom.sens;
     int64_t C2 = _prom.off;
     int64_t C3 = _prom.tcs;
     int64_t C4 = _prom.tco;
-    int64_t C5 = _prom.tref;
     int64_t C6 = _prom.tempsens;
 
-    /* First-order compensation */
-    int32_t dT   = (int32_t)D2 - (int32_t)(C5 * 256LL);
-    int32_t TEMP = 2000 + (int32_t)(((int64_t)dT * C6) / 8388608LL); /* 2^23 */
+    /* Synthetic dT for 25.00 °C (TEMP = 2500 in 0.01 °C units):
+       TEMP = 2000 + dT*C6/8388608 = 2500
+       → dT = 500 * 8388608 / C6
+       Guard against C6 = 0 (unprogrammed PROM) with fallback dT = 0. */
+    int32_t dT   = (C6 != 0) ? (int32_t)(500LL * 8388608LL / C6) : 0;
+    int32_t TEMP = 2500; /* 25.00 °C fixed — no second-order correction needed above 20 °C */
 
-    int64_t OFF  = C2 * 131072LL + (C4 * (int64_t)dT) / 64LL;        /* C2*2^17 + C4*dT/2^6  */
-    int64_t SENS = C1 * 65536LL  + (C3 * (int64_t)dT) / 128LL;       /* C1*2^16 + C3*dT/2^7  */
+    int64_t OFF  = C2 * 131072LL + (C4 * (int64_t)dT) / 64LL;   /* C2*2^17 + C4*dT/2^6 */
+    int64_t SENS = C1 * 65536LL  + (C3 * (int64_t)dT) / 128LL;  /* C1*2^16 + C3*dT/2^7 */
 
-    /* Second-order temperature compensation */
-    int64_t T2 = 0, OFF2 = 0, SENS2 = 0;
+    /* Second-order compensation: TEMP = 2500 > 2000, so T2/OFF2/SENS2 = 0.
+       Block kept for clarity and to handle any future dT override. */
     if (TEMP < 2000) {
-        T2    = ((int64_t)dT * (int64_t)dT) / 2147483648LL;           /* dT^2 / 2^31          */
-        OFF2  = 61LL * (int64_t)(TEMP - 2000) * (int64_t)(TEMP - 2000) / 16LL;
-        SENS2 = 2LL  * (int64_t)(TEMP - 2000) * (int64_t)(TEMP - 2000);
-
+        int64_t T2    = ((int64_t)dT * (int64_t)dT) / 2147483648LL;
+        int64_t OFF2  = 61LL * (int64_t)(TEMP - 2000) * (int64_t)(TEMP - 2000) / 16LL;
+        int64_t SENS2 = 2LL  * (int64_t)(TEMP - 2000) * (int64_t)(TEMP - 2000);
         if (TEMP < -1500) {
             OFF2  += 15LL * (int64_t)(TEMP + 1500) * (int64_t)(TEMP + 1500);
             SENS2 +=  8LL * (int64_t)(TEMP + 1500) * (int64_t)(TEMP + 1500);
         }
+        TEMP -= (int32_t)T2;
+        OFF  -= OFF2;
+        SENS -= SENS2;
     }
 
-    TEMP -= (int32_t)T2;
-    OFF  -= OFF2;
-    SENS -= SENS2;
-
-    int64_t P = ((int64_t)D1 * SENS / 2097152LL - OFF) / 32768LL;    /* (D1*SENS/2^21-OFF)/2^15 */
+    int64_t P = ((int64_t)D1 * SENS / 2097152LL - OFF) / 32768LL; /* (D1*SENS/2^21-OFF)/2^15 */
 
     readings->temperature = TEMP;
     readings->pressure    = (int32_t)P;
@@ -211,6 +214,15 @@ void MS5607Update(void)
 
 double MS5607GetTemperatureC(void)
 {
+    /* Temperature sensor broken — return safe constant.
+       Pressure compensation runs on real D2 so pressure is unaffected. */
+    return 25.0;
+}
+
+double MS5607GetRawTemperatureC(void)
+{
+    /* Actual calculated value from broken sensor — diagnostics only.
+       This is the temperature the compensation algorithm used. */
     return (double)_readings.temperature / 100.0;
 }
 

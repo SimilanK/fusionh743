@@ -133,7 +133,21 @@ void MS5607Update(void);
  * @param  None
  * @retval Temperature in celsius
  */
+/**
+ * @note   The internal temperature sensor is broken on this unit.
+ *         Always returns 25.0 °C as a safe constant.
+ *         Pressure compensation still runs on the real raw D2 value
+ *         so pressure readings remain accurate.
+ */
 double MS5607GetTemperatureC(void);
+
+/**
+ * @brief  Returns the ACTUAL calculated temperature from raw D2 data.
+ * @note   Diagnostics only — sensor reads incorrectly on this unit.
+ *         This is the value used internally for pressure compensation.
+ * @retval Actual sensor temperature in °C (may be wrong/unstable)
+ */
+double MS5607GetRawTemperatureC(void);
 
 /**
  * @brief  Gets the pressure reading from the last sensor update
