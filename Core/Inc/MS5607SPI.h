@@ -187,6 +187,46 @@ void MS5607SetTemperatureOSR(MS5607OSRFactors);
  */
 void MS5607SetPressureOSR(MS5607OSRFactors);
 
+/* ── Non-blocking (poll-based) interface ─────────────────────────────────────
+ *
+ * Use these instead of MS5607Update() when the main loop must not block.
+ * The state machine advances each time MS5607_Poll() is called and uses
+ * HAL_GetTick() deadlines instead of HAL_Delay(), so the CPU is free to
+ * run other code (IMU reads, servo, logging) between calls.
+ *
+ * Typical usage:
+ *   while (1) {
+ *       if (MS5607_Poll()) {
+ *           ts = MS5607_GetSampleTick();   // accurate measurement timestamp
+ *           alt = MS5607GetAltitudeM();    // getters valid until next Poll()==1
+ *           ...
+ *       }
+ *       // other work here — no HAL_Delay() needed
+ *   }
+ *
+ * Do NOT mix with MS5607Update() in the same application.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * @brief  Advance the non-blocking baro state machine.
+ *         Call every main-loop iteration (or as fast as possible).
+ *         Internally: IDLE → WAIT_D1 → WAIT_D2 → (kick next D1) → return 1.
+ *         When returning 1, the next D1 conversion has already been issued so
+ *         the baro conversion overlaps the caller's processing time.
+ * @retval 1  New pressure+temperature data available. Read MS5607Get*() now.
+ *         0  Conversion still in progress — call again next iteration.
+ */
+uint8_t  MS5607_Poll(void);
+
+/**
+ * @brief  HAL_GetTick() value captured when the D1 pressure conversion command
+ *         was issued for the most recently completed sample.
+ *         This is the true measurement timestamp — use it instead of calling
+ *         HAL_GetTick() after the conversion math finishes (~40 ms later).
+ * @note   Valid only after MS5607_Poll() has returned 1 at least once.
+ */
+uint32_t MS5607_GetSampleTick(void);
+
 #ifdef __cplusplus
 }
 #endif

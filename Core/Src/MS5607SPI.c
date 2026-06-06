@@ -44,6 +44,17 @@ static struct MS5607Readings            _readings;
 static MS5607OSRFactors _tempOSR     = OSR_4096;
 static MS5607OSRFactors _pressureOSR = OSR_4096;
 
+/* ── Non-blocking state machine ─────────────────────────────────────────── */
+typedef enum {
+    MS5607_NB_IDLE,     /* no conversion running; Poll() starts D1             */
+    MS5607_NB_WAIT_D1,  /* D1 pressure conversion running; waiting for deadline */
+    MS5607_NB_WAIT_D2,  /* D2 temperature conversion running; waiting for deadline */
+} MS5607_NB_State_t;
+
+static MS5607_NB_State_t _nb_state      = MS5607_NB_IDLE;
+static uint32_t          _nb_conv_start = 0; /* HAL_GetTick() when current conv started */
+static uint32_t          _nb_tick       = 0; /* HAL_GetTick() when D1 was issued (= measurement time) */
+
 /* --- OSR to conversion delay (ms) ---------------------------------------- */
 
 static uint32_t getConversionDelay(MS5607OSRFactors osr)
@@ -250,4 +261,78 @@ double MS5607GetAltitudeM(void) {
 void MS5607SetPressureOSR(MS5607OSRFactors osr)
 {
     _pressureOSR = osr;
+}
+
+/* ── Non-blocking implementation ────────────────────────────────────────── */
+
+/* Issue a single-byte command on SPI1 (CS toggled around it). */
+static inline void _nb_send_cmd(uint8_t cmd)
+{
+    uint8_t rx;
+    enableCSB();
+    HAL_SPI_TransmitReceive(_hspi, &cmd, &rx, 1, HAL_MAX_DELAY);
+    disableCSB();
+}
+
+/* Read 3 ADC bytes from the sensor into a uint32_t. */
+static inline uint32_t _nb_read_adc(void)
+{
+    uint8_t tx[4] = {READ_ADC_COMMAND, 0xFF, 0xFF, 0xFF};
+    uint8_t rx[4];
+    enableCSB();
+    HAL_SPI_TransmitReceive(_hspi, tx, rx, 4, HAL_MAX_DELAY);
+    disableCSB();
+    return ((uint32_t)rx[1] << 16) | ((uint32_t)rx[2] << 8) | rx[3];
+}
+
+uint8_t MS5607_Poll(void)
+{
+    switch (_nb_state) {
+
+    /* ── IDLE: kick off a fresh D1 pressure conversion ─────────────────── */
+    case MS5607_NB_IDLE:
+        _nb_tick       = HAL_GetTick();   /* record measurement timestamp    */
+        _nb_conv_start = _nb_tick;
+        _nb_send_cmd(CONVERT_D1_COMMAND | (uint8_t)_pressureOSR);
+        _nb_state = MS5607_NB_WAIT_D1;
+        return 0;
+
+    /* ── WAIT_D1: poll until D1 ADC ready ──────────────────────────────── */
+    case MS5607_NB_WAIT_D1:
+        /* Unsigned subtraction handles HAL_GetTick() 32-bit wraparound.    */
+        if (HAL_GetTick() - _nb_conv_start < getConversionDelay(_pressureOSR))
+            return 0;
+        _raw.pressure  = _nb_read_adc();
+        _nb_conv_start = HAL_GetTick();
+        _nb_send_cmd(CONVERT_D2_COMMAND | (uint8_t)_tempOSR);
+        _nb_state = MS5607_NB_WAIT_D2;
+        return 0;
+
+    /* ── WAIT_D2: poll until D2 ADC ready ──────────────────────────────── */
+    case MS5607_NB_WAIT_D2:
+        if (HAL_GetTick() - _nb_conv_start < getConversionDelay(_tempOSR))
+            return 0;
+        _raw.temperature = _nb_read_adc();
+        MS5607Convert(&_raw, &_readings);
+
+        /* Immediately start the NEXT D1 so its 20 ms conversion window
+           overlaps the caller's ICM read, UART write, and SD write.
+           This keeps the effective baro rate at ~25 Hz regardless of
+           how long the caller's post-processing takes (up to ~20 ms).     */
+        _nb_tick       = HAL_GetTick();
+        _nb_conv_start = _nb_tick;
+        _nb_send_cmd(CONVERT_D1_COMMAND | (uint8_t)_pressureOSR);
+        _nb_state = MS5607_NB_WAIT_D1;
+
+        return 1;   /* data ready — getters valid until the next return 1  */
+
+    default:
+        _nb_state = MS5607_NB_IDLE;
+        return 0;
+    }
+}
+
+uint32_t MS5607_GetSampleTick(void)
+{
+    return _nb_tick;
 }

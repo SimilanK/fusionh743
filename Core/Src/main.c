@@ -214,84 +214,106 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
+      /* Servo sweep state — persists across iterations */
+      static float    servoPos  = 0.0f;
+      static float    servoDir  = 1.0f;
+      static uint32_t servoTick = 0;
+      /* SD sync counter — flush every 10 rows to avoid per-row stall */
+      static uint8_t  syncCount = 0;
 
-	  //Baro update
-      MS5607Update();
-      liveTelemetry.timestamp     = HAL_GetTick();
-      liveTelemetry.pressure_pa   = MS5607GetPressurePa();
-      liveTelemetry.temperature_c = MS5607GetTemperatureC();
-      liveTelemetry.altitude_m    = MS5607GetAltitudeM();
+      /* ── Non-blocking barometer poll ─────────────────────────────────────
+         MS5607_Poll() advances an internal state machine using HAL_GetTick()
+         deadlines (no HAL_Delay inside).  Returns 1 when a complete
+         pressure+temperature sample is ready.  The next D1 conversion has
+         already been issued before returning, so it overlaps the ICM read,
+         UART write, and SD write that follow.                               */
+      if (MS5607_Poll()) {
 
-      //IMU update
-      ICM45686_Update();
-      liveTelemetry.accel_x_mss = ICM45686_GetAccelX_mss();
-      liveTelemetry.accel_y_mss = ICM45686_GetAccelY_mss();
-      liveTelemetry.accel_z_mss = ICM45686_GetAccelZ_mss();
-      liveTelemetry.gyro_x_rads = ICM45686_GetGyroX_rads();
-      liveTelemetry.gyro_y_rads = ICM45686_GetGyroY_rads();
-      liveTelemetry.gyro_z_rads = ICM45686_GetGyroZ_rads();
-      liveTelemetry.imu_temp_c  = ICM45686_GetTemperature_C();
-      
-      int len = snprintf(uartTxBuffer, sizeof(uartTxBuffer),
-                         "%lu,%ld,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.2f\r\n",
-                         liveTelemetry.timestamp,
-                         liveTelemetry.pressure_pa,
-                         liveTelemetry.temperature_c,
-                         liveTelemetry.altitude_m,
-                         (double)liveTelemetry.servo_deg,
-                         (double)liveTelemetry.accel_x_mss,
-                         (double)liveTelemetry.accel_y_mss,
-                         (double)liveTelemetry.accel_z_mss,
-                         (double)liveTelemetry.gyro_x_rads,
-                         (double)liveTelemetry.gyro_y_rads,
-                         (double)liveTelemetry.gyro_z_rads,
-                         (double)liveTelemetry.imu_temp_c);
-         if (len > 0) {
-             HAL_UART_Transmit(&huart2, (uint8_t *)uartTxBuffer, (uint16_t)len, HAL_MAX_DELAY);
-         }
+          /* Timestamp = when D1 was issued (~40 ms earlier than if stamped
+             after blocking MS5607Update() returns).                        */
+          liveTelemetry.timestamp     = MS5607_GetSampleTick();
+          liveTelemetry.pressure_pa   = MS5607GetPressurePa();
+          liveTelemetry.temperature_c = MS5607GetTemperatureC();
+          liveTelemetry.altitude_m    = MS5607GetAltitudeM();
 
+          /* IMU burst-read on SPI4 — no conflict with baro on SPI1.
+             The baro D1 conversion runs in the sensor's internal ADC
+             while the CPU reads the ICM over the separate SPI4 bus.       */
+          ICM45686_Update();
+          liveTelemetry.accel_x_mss = ICM45686_GetAccelX_mss();
+          liveTelemetry.accel_y_mss = ICM45686_GetAccelY_mss();
+          liveTelemetry.accel_z_mss = ICM45686_GetAccelZ_mss();
+          liveTelemetry.gyro_x_rads = ICM45686_GetGyroX_rads();
+          liveTelemetry.gyro_y_rads = ICM45686_GetGyroY_rads();
+          liveTelemetry.gyro_z_rads = ICM45686_GetGyroZ_rads();
+          liveTelemetry.imu_temp_c  = ICM45686_GetTemperature_C();
 
-         //sd
-         if (sdReady) {
-               UINT bw;
-               int sdLen = snprintf(sdWriteBuffer, sizeof(sdWriteBuffer),
-                                    "%lu,%ld,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.2f\r\n",
-                                    liveTelemetry.timestamp,
-                                    liveTelemetry.pressure_pa,
-                                    liveTelemetry.temperature_c,
-                                    liveTelemetry.altitude_m,
-                                    (double)liveTelemetry.servo_deg,
-                                    (double)liveTelemetry.accel_x_mss,
-                                    (double)liveTelemetry.accel_y_mss,
-                                    (double)liveTelemetry.accel_z_mss,
-                                    (double)liveTelemetry.gyro_x_rads,
-                                    (double)liveTelemetry.gyro_y_rads,
-                                    (double)liveTelemetry.gyro_z_rads,
-                                    (double)liveTelemetry.imu_temp_c);
-               if (sdLen > 0) {
-                   f_write(&LogFile, sdWriteBuffer, (UINT)sdLen, &bw);
-                   f_sync(&LogFile);
-               }
-           }
+          /* UART */
+          int len = snprintf(uartTxBuffer, sizeof(uartTxBuffer),
+                             "%lu,%ld,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.2f\r\n",
+                             liveTelemetry.timestamp,
+                             liveTelemetry.pressure_pa,
+                             liveTelemetry.temperature_c,
+                             liveTelemetry.altitude_m,
+                             (double)liveTelemetry.servo_deg,
+                             (double)liveTelemetry.accel_x_mss,
+                             (double)liveTelemetry.accel_y_mss,
+                             (double)liveTelemetry.accel_z_mss,
+                             (double)liveTelemetry.gyro_x_rads,
+                             (double)liveTelemetry.gyro_y_rads,
+                             (double)liveTelemetry.gyro_z_rads,
+                             (double)liveTelemetry.imu_temp_c);
+          if (len > 0) {
+              HAL_UART_Transmit(&huart2, (uint8_t *)uartTxBuffer, (uint16_t)len, HAL_MAX_DELAY);
+          }
 
-         //servo
-         float servoMin =   27.0f, servoMax = 140.0f;
-         static float servoPos = 0.0f;
-         static float servoDir = 1.0f;
-         float step = (servoMax - servoMin) / 40.0f;
-  	 	servoPos += servoDir * step;
-         if (servoPos >= servoMax) { servoPos = servoMax; servoDir = -1.0f; }
-         if (servoPos <= servoMin) { servoPos = servoMin; servoDir =  1.0f; }
-         liveTelemetry.servo_deg = servoPos;
-         servoSetAngle(servoPos);
-         // 	 	liveTelemetry.servo_deg = servoMin;
-         //        servoSetAngle(servoMin);
+          /* SD: write every sample; sync every 10 rows.
+             f_sync on every row can stall the loop for 5-50 ms per call.
+             Batching to every 10 rows keeps the stall rare and bounded.   */
+          if (sdReady) {
+              UINT bw;
+              int sdLen = snprintf(sdWriteBuffer, sizeof(sdWriteBuffer),
+                                   "%lu,%ld,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.2f\r\n",
+                                   liveTelemetry.timestamp,
+                                   liveTelemetry.pressure_pa,
+                                   liveTelemetry.temperature_c,
+                                   liveTelemetry.altitude_m,
+                                   (double)liveTelemetry.servo_deg,
+                                   (double)liveTelemetry.accel_x_mss,
+                                   (double)liveTelemetry.accel_y_mss,
+                                   (double)liveTelemetry.accel_z_mss,
+                                   (double)liveTelemetry.gyro_x_rads,
+                                   (double)liveTelemetry.gyro_y_rads,
+                                   (double)liveTelemetry.gyro_z_rads,
+                                   (double)liveTelemetry.imu_temp_c);
+              if (sdLen > 0) {
+                  f_write(&LogFile, sdWriteBuffer, (UINT)sdLen, &bw);
+                  if (++syncCount >= 10) {
+                      f_sync(&LogFile);
+                      syncCount = 0;
+                  }
+              }
+          }
+      }
 
-         // 	 	liveTelemetry.servo_deg = servoMax;
-         //        servoSetAngle(servoMax);
+      /* ── Servo sweep — independent 150 ms cadence ───────────────────────
+         40 steps × 150 ms = 6 s per full sweep, same as the original loop
+         that ran at ~150 ms/iteration due to HAL_Delay(100) + baro blocking.
+         The servo update is now decoupled from the baro data-ready event.  */
+      if (HAL_GetTick() - servoTick >= 150) {
+          servoTick = HAL_GetTick();
+          const float servoMin = 27.0f, servoMax = 140.0f;
+          const float step     = (servoMax - servoMin) / 40.0f;
+          servoPos += servoDir * step;
+          if (servoPos >= servoMax) { servoPos = servoMax; servoDir = -1.0f; }
+          if (servoPos <= servoMin) { servoPos = servoMin; servoDir =  1.0f; }
+          liveTelemetry.servo_deg = servoPos;
+          servoSetAngle(servoPos);
+      }
 
-
-          HAL_Delay(100);
+      /* No HAL_Delay() — loop runs free.
+         Baro rate (~25 Hz) is now set by the MS5607 OSR_4096 conversion time
+         (2 × 20 ms), not by an arbitrary delay.                            */
 
   }
   /* USER CODE END 3 */
