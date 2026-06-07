@@ -27,6 +27,7 @@
 #include <math.h>
 #include "MS5607SPI.h"
 #include "ICMSPI.h"
+#include "Kalman2State.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -44,6 +45,9 @@ typedef struct {
     float    gyro_y_rads;
     float    gyro_z_rads;
     float    imu_temp_c;
+    /* Kalman filter outputs — logged alongside raw sensors for validation */
+    float    kf_altitude_m;   /* fused altitude, AGL [m]    */
+    float    kf_velocity_ms;  /* fused vertical velocity [m/s], positive = up */
 } BundleData_t;
 /* USER CODE END PTD */
 
@@ -53,6 +57,10 @@ typedef struct {
 // Start with the values below and increase/decrease by ~50 µs steps.       */
 #define SERVO_MIN_US   560   /* pulse width (µs) that produces physical  0° */
 #define SERVO_MAX_US  2460   /* pulse width (µs) that produces physical 180° (estimated: symmetric around 1520 µs center) */
+
+/* Pad calibration: number of baro samples averaged at boot to set h0 and g_cal.
+ * At ~25 Hz this is ~4 seconds.  Board must be stationary during this window.  */
+#define PAD_CAL_N 100
 
 /* USER CODE END PD */
 
@@ -78,15 +86,20 @@ UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 volatile BundleData_t liveTelemetry = {0};
-char uartTxBuffer[160];
+char uartTxBuffer[200];   /* 200 bytes: original 12 cols (~85 chars) + 2 KF cols + margin */
 
 /* 32-byte aligned: SDMMC IDMA bypasses D-Cache and reads directly from SRAM.
    FatFs's internal sector buffer (fs->win) lives inside SDFatFs — aligning it
    ensures SCB_CleanDCache covers the correct cache lines before IDMA reads. */
 __attribute__((aligned(32))) FATFS SDFatFs;
 __attribute__((aligned(32))) FIL   LogFile;
-__attribute__((aligned(32))) char  sdWriteBuffer[160];
+__attribute__((aligned(32))) char  sdWriteBuffer[200];
 uint8_t sdReady = 0;
+
+/* Kalman filter instance and pad reference values set during pad calibration */
+Kalman2State kf;
+float h0    = 0.0f;   /* pad altitude [m] — subtracted to give AGL output    */
+float g_cal = 9.81f;  /* measured 1g on az axis [m/s^2] — replaces nominal   */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -169,9 +182,10 @@ int main(void)
   //NOTE: SPI4 must be Mode 3 (CPOL=High, CPHA=2Edge) in CubeMX
   ICM45686_Init(&hspi4, ICM_CS_GPIO_Port, ICM_CS_Pin);
 
-  //UART header
+  //UART header — two KF columns added at the end (backward compatible: old parsers ignore them)
   const char *uartHeader = "timestamp_ms,pressure_pa,temperature_c,altitude_m,servo_deg,"
-                            "ax_mss,ay_mss,az_mss,gx_rads,gy_rads,gz_rads,imu_temp_c\r\n";
+                            "ax_mss,ay_mss,az_mss,gx_rads,gy_rads,gz_rads,imu_temp_c,"
+                            "kf_altitude_m,kf_velocity_ms\r\n";
   HAL_UART_Transmit(&huart2, (uint8_t *)uartHeader, (uint16_t)strlen(uartHeader), HAL_MAX_DELAY);
 
   //sd init — 500ms lets SDMMC card finish power-up before f_mount
@@ -193,7 +207,8 @@ int main(void)
                f_lseek(&LogFile, f_size(&LogFile));
                if (f_size(&LogFile) == 0) {
                    const char *hdr = "timestamp_ms,pressure_pa,temperature_c,altitude_m,servo_deg,"
-                                      "ax_mss,ay_mss,az_mss,gx_rads,gy_rads,gz_rads,imu_temp_c\r\n";
+                                      "ax_mss,ay_mss,az_mss,gx_rads,gy_rads,gz_rads,imu_temp_c,"
+                                      "kf_altitude_m,kf_velocity_ms\r\n";
                    UINT bw;
                    f_write(&LogFile, hdr, strlen(hdr), &bw);
                    f_sync(&LogFile);
@@ -204,6 +219,51 @@ int main(void)
        }
    }
 
+  /* ── Pad calibration ────────────────────────────────────────────────────────
+   * Collect PAD_CAL_N baro+IMU samples at rest to measure:
+   *   h0    : absolute pad altitude [m].  Subtracted from every baro reading so
+   *           the Kalman filter outputs AGL (above-ground-level) altitude.
+   *   g_cal : true 1g along the az axis [m/s^2] as measured by THIS sensor.
+   *           Replaces the nominal 9.81 so the predict step's gravity subtraction
+   *           is exact for this unit's ADC offset.
+   * Board MUST be stationary and level during this ~4 second window.
+   * TODO: confirm az_mss is the vertical axis for your board mounting orientation.
+   *       If the rocket is nose-up and az reads ~+9.81 on the pad, this is correct.
+   *       If az reads ~0 on the pad, use accel_z_mss = -ICM45686_GetAccelZ_mss()
+   *       or pick ax/ay depending on how the board is mounted in the airframe.   */
+  {
+      float h0_sum = 0.0f, g_sum = 0.0f;
+      uint32_t cal_n = 0;
+      HAL_UART_Transmit(&huart2, (uint8_t *)"Calibrating pad...\r\n", 20, HAL_MAX_DELAY);
+      while (cal_n < PAD_CAL_N) {
+          if (MS5607_Poll()) {
+              ICM45686_Update();
+              h0_sum += (float)MS5607GetAltitudeM();
+              g_sum  += ICM45686_GetAccelZ_mss();   /* should be ~+9.81 at rest, nose-up */
+              cal_n++;
+          }
+      }
+      h0    = h0_sum / (float)PAD_CAL_N;
+      g_cal = g_sum  / (float)PAD_CAL_N;
+
+      /* Initialise the filter with the measured values.
+       * x0=0 (AGL starts at zero), x1=0 (at rest on the pad).
+       * gravity = g_cal replaces the default 9.81 with what the sensor actually reads. */
+      Kalman2State_Init(&kf, 0.0f);
+      Kalman2State_SetTuning(&kf,
+                             -1.0f,    /* keep default R (0.02 m^2) — tune in MATLAB */
+                             -1.0f,    /* keep default sigmaA (0.10 m/s^2)           */
+                             g_cal,    /* use pad-measured gravity                    */
+                             -1.0f);   /* keep default baroDistrustSpeed (50 m/s)     */
+
+      {
+          char cal_msg[80];
+          int n = snprintf(cal_msg, sizeof(cal_msg),
+                           "Pad cal done: h0=%.2fm  g_cal=%.4fm/s2\r\n", (double)h0, (double)g_cal);
+          HAL_UART_Transmit(&huart2, (uint8_t *)cal_msg, (uint16_t)n, HAL_MAX_DELAY);
+      }
+  }
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -213,6 +273,9 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+
+      /* dt tracking for Kalman predict step — persists across iterations */
+      static uint32_t prev_timestamp = 0;
 
       /* Servo sweep state — persists across iterations */
       static float    servoPos  = 0.0f;
@@ -248,9 +311,37 @@ int main(void)
           liveTelemetry.gyro_z_rads = ICM45686_GetGyroZ_rads();
           liveTelemetry.imu_temp_c  = ICM45686_GetTemperature_C();
 
+          /* ── Kalman filter ─────────────────────────────────────────────────
+           * PREDICT: propagate state using the accelerometer.
+           *   dt   = elapsed time since previous sample [s].
+           *          Computed from the baro sample ticks (accurate timestamps).
+           *          Guarded inside Kalman2State_Predict: skipped if dt <= 0.
+           *   accel = az_mss — the vertical-axis specific force.
+           *          At rest on the pad, az ≈ +g (sensor sits in gravity).
+           *          Kalman2State_Predict subtracts g_cal internally, leaving
+           *          u = 0 on the pad, which is correct (no net acceleration).
+           *   TODO: if az reads ~0 on the pad (board 90° sideways), change this
+           *         to the correct axis.
+           *
+           * UPDATE: correct with the barometric altitude.
+           *   We pass (altitude_m - h0) so the filter works in AGL metres.  */
+          {
+              float dt = 0.0f;
+              if (prev_timestamp > 0) {
+                  dt = (float)(liveTelemetry.timestamp - prev_timestamp) / 1000.0f;
+              }
+              prev_timestamp = liveTelemetry.timestamp;
+
+              Kalman2State_Predict(&kf, liveTelemetry.accel_z_mss, dt);
+              Kalman2State_UpdateBaro(&kf, (float)liveTelemetry.altitude_m - h0);
+
+              liveTelemetry.kf_altitude_m  = Kalman2State_Altitude(&kf);
+              liveTelemetry.kf_velocity_ms = Kalman2State_Velocity(&kf);
+          }
+
           /* UART */
           int len = snprintf(uartTxBuffer, sizeof(uartTxBuffer),
-                             "%lu,%ld,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.2f\r\n",
+                             "%lu,%ld,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.2f,%.3f,%.4f\r\n",
                              liveTelemetry.timestamp,
                              liveTelemetry.pressure_pa,
                              liveTelemetry.temperature_c,
@@ -262,7 +353,9 @@ int main(void)
                              (double)liveTelemetry.gyro_x_rads,
                              (double)liveTelemetry.gyro_y_rads,
                              (double)liveTelemetry.gyro_z_rads,
-                             (double)liveTelemetry.imu_temp_c);
+                             (double)liveTelemetry.imu_temp_c,
+                             (double)liveTelemetry.kf_altitude_m,
+                             (double)liveTelemetry.kf_velocity_ms);
           if (len > 0) {
               HAL_UART_Transmit(&huart2, (uint8_t *)uartTxBuffer, (uint16_t)len, HAL_MAX_DELAY);
           }
@@ -273,7 +366,7 @@ int main(void)
           if (sdReady) {
               UINT bw;
               int sdLen = snprintf(sdWriteBuffer, sizeof(sdWriteBuffer),
-                                   "%lu,%ld,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.2f\r\n",
+                                   "%lu,%ld,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.2f,%.3f,%.4f\r\n",
                                    liveTelemetry.timestamp,
                                    liveTelemetry.pressure_pa,
                                    liveTelemetry.temperature_c,
@@ -285,7 +378,9 @@ int main(void)
                                    (double)liveTelemetry.gyro_x_rads,
                                    (double)liveTelemetry.gyro_y_rads,
                                    (double)liveTelemetry.gyro_z_rads,
-                                   (double)liveTelemetry.imu_temp_c);
+                                   (double)liveTelemetry.imu_temp_c,
+                                   (double)liveTelemetry.kf_altitude_m,
+                                   (double)liveTelemetry.kf_velocity_ms);
               if (sdLen > 0) {
                   f_write(&LogFile, sdWriteBuffer, (UINT)sdLen, &bw);
                   if (++syncCount >= 10) {
