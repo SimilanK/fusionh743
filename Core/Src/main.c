@@ -28,6 +28,7 @@
 #include "MS5607SPI.h"
 #include "ICMSPI.h"
 #include "Kalman2State.h"
+#include "ao_flight.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -57,10 +58,6 @@ typedef struct {
 // Start with the values below and increase/decrease by ~50 µs steps.       */
 #define SERVO_MIN_US   560   /* pulse width (µs) that produces physical  0° */
 #define SERVO_MAX_US  2460   /* pulse width (µs) that produces physical 180° (estimated: symmetric around 1520 µs center) */
-
-/* Pad calibration: number of baro samples averaged at boot to set h0 and g_cal.
- * At ~25 Hz this is ~4 seconds.  Board must be stationary during this window.  */
-#define PAD_CAL_N 100
 
 /* USER CODE END PD */
 
@@ -96,10 +93,9 @@ __attribute__((aligned(32))) FIL   LogFile;
 __attribute__((aligned(32))) char  sdWriteBuffer[200];
 uint8_t sdReady = 0;
 
-/* Kalman filter instance and pad reference values set during pad calibration */
+/* Kalman filter instance — passed by pointer to ao_flight_update() every sample.
+ * ao_ground_height and ao_ground_accel are now owned by ao_flight.c.           */
 Kalman2State kf;
-float h0    = 0.0f;   /* pad altitude [m] — subtracted to give AGL output    */
-float g_cal = 9.81f;  /* measured 1g on az axis [m/s^2] — replaces nominal   */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -219,50 +215,11 @@ int main(void)
        }
    }
 
-  /* ── Pad calibration ────────────────────────────────────────────────────────
-   * Collect PAD_CAL_N baro+IMU samples at rest to measure:
-   *   h0    : absolute pad altitude [m].  Subtracted from every baro reading so
-   *           the Kalman filter outputs AGL (above-ground-level) altitude.
-   *   g_cal : true 1g along the az axis [m/s^2] as measured by THIS sensor.
-   *           Replaces the nominal 9.81 so the predict step's gravity subtraction
-   *           is exact for this unit's ADC offset.
-   * Board MUST be stationary and level during this ~4 second window.
-   * TODO: confirm az_mss is the vertical axis for your board mounting orientation.
-   *       If the rocket is nose-up and az reads ~+9.81 on the pad, this is correct.
-   *       If az reads ~0 on the pad, use accel_z_mss = -ICM45686_GetAccelZ_mss()
-   *       or pick ax/ay depending on how the board is mounted in the airframe.   */
-  {
-      float h0_sum = 0.0f, g_sum = 0.0f;
-      uint32_t cal_n = 0;
-      HAL_UART_Transmit(&huart2, (uint8_t *)"Calibrating pad...\r\n", 20, HAL_MAX_DELAY);
-      while (cal_n < PAD_CAL_N) {
-          if (MS5607_Poll()) {
-              ICM45686_Update();
-              h0_sum += (float)MS5607GetAltitudeM();
-              g_sum  += ICM45686_GetAccelZ_mss();   /* should be ~+9.81 at rest, nose-up */
-              cal_n++;
-          }
-      }
-      h0    = h0_sum / (float)PAD_CAL_N;
-      g_cal = g_sum  / (float)PAD_CAL_N;
-
-      /* Initialise the filter with the measured values.
-       * x0=0 (AGL starts at zero), x1=0 (at rest on the pad).
-       * gravity = g_cal replaces the default 9.81 with what the sensor actually reads. */
-      Kalman2State_Init(&kf, 0.0f);
-      Kalman2State_SetTuning(&kf,
-                             -1.0f,    /* keep default R (0.02 m^2) — tune in MATLAB */
-                             -1.0f,    /* keep default sigmaA (0.10 m/s^2)           */
-                             g_cal,    /* use pad-measured gravity                    */
-                             -1.0f);   /* keep default baroDistrustSpeed (50 m/s)     */
-
-      {
-          char cal_msg[80];
-          int n = snprintf(cal_msg, sizeof(cal_msg),
-                           "Pad cal done: h0=%.2fm  g_cal=%.4fm/s2\r\n", (double)h0, (double)g_cal);
-          HAL_UART_Transmit(&huart2, (uint8_t *)cal_msg, (uint16_t)n, HAL_MAX_DELAY);
-      }
-  }
+  /* Initialise the flight state machine.
+   * Calibration now happens non-blockingly inside ao_flight_update() during the
+   * AO_FLIGHT_STARTUP state — no blocking loop here.                           */
+  ao_flight_init();
+  HAL_UART_Transmit(&huart2, (uint8_t *)"State: STARTUP — collecting pad samples...\r\n", 44, HAL_MAX_DELAY);
 
   /* USER CODE END 2 */
 
@@ -311,32 +268,48 @@ int main(void)
           liveTelemetry.gyro_z_rads = ICM45686_GetGyroZ_rads();
           liveTelemetry.imu_temp_c  = ICM45686_GetTemperature_C();
 
-          /* ── Kalman filter ─────────────────────────────────────────────────
-           * PREDICT: propagate state using the accelerometer.
-           *   dt   = elapsed time since previous sample [s].
-           *          Computed from the baro sample ticks (accurate timestamps).
-           *          Guarded inside Kalman2State_Predict: skipped if dt <= 0.
-           *   accel = az_mss — the vertical-axis specific force.
-           *          At rest on the pad, az ≈ +g (sensor sits in gravity).
-           *          Kalman2State_Predict subtracts g_cal internally, leaving
-           *          u = 0 on the pad, which is correct (no net acceleration).
-           *   TODO: if az reads ~0 on the pad (board 90° sideways), change this
-           *         to the correct axis.
+          /* ── Flight state machine + Kalman filter ──────────────────────────
+           * ao_flight_update() runs the Kalman predict+update internally for
+           * PAD and BOOST states; in STARTUP it accumulates calibration samples.
+           * After the call, read kf outputs and ao_flight_state for logging.
            *
-           * UPDATE: correct with the barometric altitude.
-           *   We pass (altitude_m - h0) so the filter works in AGL metres.  */
+           * Vertical axis: az_mss (reads ~+9.81 at rest, nose-up on the pad).
+           * TODO: change to correct axis if board is mounted differently.     */
           {
+              ao_flight_state_t prev_state = ao_flight_state;
+
               float dt = 0.0f;
               if (prev_timestamp > 0) {
                   dt = (float)(liveTelemetry.timestamp - prev_timestamp) / 1000.0f;
               }
               prev_timestamp = liveTelemetry.timestamp;
 
-              Kalman2State_Predict(&kf, liveTelemetry.accel_z_mss, dt);
-              Kalman2State_UpdateBaro(&kf, (float)liveTelemetry.altitude_m - h0);
+              ao_flight_update(&kf,
+                               liveTelemetry.accel_z_mss,      /* vertical accel  */
+                               dt,                              /* sample period   */
+                               (float)liveTelemetry.altitude_m);/* absolute baro   */
 
               liveTelemetry.kf_altitude_m  = Kalman2State_Altitude(&kf);
               liveTelemetry.kf_velocity_ms = Kalman2State_Velocity(&kf);
+
+              /* Print on state transitions so you can see them on the UART */
+              if (prev_state != ao_flight_state) {
+                  switch (ao_flight_state) {
+                  case AO_FLIGHT_PAD: {
+                      char msg[80];
+                      int n = snprintf(msg, sizeof(msg),
+                                       "State: PAD  h0=%.2fm  g=%.4fm/s2\r\n",
+                                       (double)ao_ground_height,
+                                       (double)ao_ground_accel);
+                      HAL_UART_Transmit(&huart2, (uint8_t *)msg, (uint16_t)n, HAL_MAX_DELAY);
+                      break;
+                  }
+                  case AO_FLIGHT_BOOST:
+                      HAL_UART_Transmit(&huart2, (uint8_t *)"State: BOOST\r\n", 14, HAL_MAX_DELAY);
+                      break;
+                  default: break;
+                  }
+              }
           }
 
           /* UART */
