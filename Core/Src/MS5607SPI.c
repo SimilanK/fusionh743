@@ -52,8 +52,18 @@ typedef enum {
 } MS5607_NB_State_t;
 
 static MS5607_NB_State_t _nb_state      = MS5607_NB_IDLE;
-static uint32_t          _nb_conv_start = 0; /* HAL_GetTick() when current conv started */
-static uint32_t          _nb_tick       = 0; /* HAL_GetTick() when D1 was issued (= measurement time) */
+static uint32_t          _nb_conv_start = 0; /* HAL_GetTick() when current conv started        */
+
+/* TWO timestamps are required because the machine is 2-deep: when Poll() returns
+ * a completed sample, the NEXT sample's D1 conversion has already been issued, so
+ * two D1-issue times are live at once.
+ *   _nb_tick        : D1-issue time of the conversion currently IN FLIGHT
+ *   _nb_sample_tick : D1-issue time of the sample whose data is in _readings NOW
+ *                     (this is what MS5607_GetSampleTick() must return)
+ * Earlier this was a single register; overwriting it with the next D1 time made
+ * GetSampleTick() report a tick ~40 ms newer than the data it accompanied. */
+static uint32_t          _nb_tick        = 0; /* in-flight conversion's D1-issue time          */
+static uint32_t          _nb_sample_tick = 0; /* returned sample's measurement (D1-issue) time */
 
 /* --- OSR to conversion delay (ms) ---------------------------------------- */
 
@@ -315,10 +325,16 @@ uint8_t MS5607_Poll(void)
         _raw.temperature = _nb_read_adc();
         MS5607Convert(&_raw, &_readings);
 
+        /* Capture the measurement time of the sample we are about to return,
+           BEFORE _nb_tick is overwritten by the next D1 below. This is the
+           pipeline register the earlier version was missing. */
+        _nb_sample_tick = _nb_tick;
+
         /* Immediately start the NEXT D1 so its 20 ms conversion window
            overlaps the caller's ICM read, UART write, and SD write.
            This keeps the effective baro rate at ~25 Hz regardless of
-           how long the caller's post-processing takes (up to ~20 ms).     */
+           how long the caller's post-processing takes (up to ~20 ms).
+           _nb_tick now tracks THIS new in-flight conversion.               */
         _nb_tick       = HAL_GetTick();
         _nb_conv_start = _nb_tick;
         _nb_send_cmd(CONVERT_D1_COMMAND | (uint8_t)_pressureOSR);
@@ -334,5 +350,5 @@ uint8_t MS5607_Poll(void)
 
 uint32_t MS5607_GetSampleTick(void)
 {
-    return _nb_tick;
+    return _nb_sample_tick;
 }

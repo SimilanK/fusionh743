@@ -17,21 +17,29 @@
 ao_flight_state_t ao_flight_state = AO_FLIGHT_STARTUP;
 float ao_ground_height = 0.0f;   /* absolute pad altitude [m] */
 float ao_ground_accel  = 9.81f;  /* measured 1g on vertical axis [m/s²] */
+uint32_t ao_cal_reject_count = 0;  /* incremented each time a cal batch is rejected */
 
 /* ── Private calibration accumulator ────────────────────────────────────────── */
 static float    _cal_height_sum = 0.0f;
 static float    _cal_accel_sum  = 0.0f;
 static uint32_t _cal_count      = 0;
 
+/* Reset the calibration accumulators (start a fresh averaging batch). */
+static void _cal_reset(void)
+{
+    _cal_height_sum = 0.0f;
+    _cal_accel_sum  = 0.0f;
+    _cal_count      = 0;
+}
+
 /* ─────────────────────────────────────────────────────────────────────────────── */
 void ao_flight_init(void)
 {
-    ao_flight_state   = AO_FLIGHT_STARTUP;
-    ao_ground_height  = 0.0f;
-    ao_ground_accel   = 9.81f;
-    _cal_height_sum   = 0.0f;
-    _cal_accel_sum    = 0.0f;
-    _cal_count        = 0;
+    ao_flight_state     = AO_FLIGHT_STARTUP;
+    ao_ground_height    = 0.0f;
+    ao_ground_accel     = 9.81f;
+    ao_cal_reject_count = 0;
+    _cal_reset();
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────── */
@@ -54,14 +62,37 @@ void ao_flight_update(Kalman2State *kf,
      * Note: Kalman is NOT called here — it isn't initialised yet.
      * The kf pointer is valid but untouched until the transition.           */
     case AO_FLIGHT_STARTUP:
+        /* Reject non-finite sensor reads outright (SPI glitch / NaN) without
+         * polluting the running sums — drop this sample, keep collecting.    */
+        if (!isfinite(baro_alt_abs) || !isfinite(accel_long)) {
+            break;
+        }
+
         _cal_height_sum += baro_alt_abs;
         _cal_accel_sum  += accel_long;
         _cal_count++;
 
         if (_cal_count >= AO_FLIGHT_STARTUP_SAMPLES) {
-            /* Compute pad references */
-            ao_ground_height = _cal_height_sum / (float)AO_FLIGHT_STARTUP_SAMPLES;
-            ao_ground_accel  = _cal_accel_sum  / (float)AO_FLIGHT_STARTUP_SAMPLES;
+            float h = _cal_height_sum / (float)AO_FLIGHT_STARTUP_SAMPLES;
+            float g = _cal_accel_sum  / (float)AO_FLIGHT_STARTUP_SAMPLES;
+
+            /* ── Sanity gate (mirrors AltOS startup validation) ──────────────
+             * If the averaged references are out of band, the board was moving,
+             * a sensor glitched, or the baro blew out. Do NOT arm: reject the
+             * batch, count it, and restart calibration. This is the safe
+             * default — STARTUP simply repeats until a clean batch is seen.   */
+            if (g < AO_CAL_ACCEL_MIN  || g > AO_CAL_ACCEL_MAX ||
+                h < AO_CAL_HEIGHT_MIN || h > AO_CAL_HEIGHT_MAX ||
+                !isfinite(g) || !isfinite(h))
+            {
+                ao_cal_reject_count++;
+                _cal_reset();        /* throw out this batch, start over */
+                break;
+            }
+
+            /* Clean batch — commit references */
+            ao_ground_height = h;
+            ao_ground_accel  = g;
 
             /* Initialise filter (state → filter, one-shot)
              * x0 = 0 (AGL starts at zero on the pad)

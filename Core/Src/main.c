@@ -289,8 +289,32 @@ int main(void)
                                dt,                              /* sample period   */
                                (float)liveTelemetry.altitude_m);/* absolute baro   */
 
-              liveTelemetry.kf_altitude_m  = Kalman2State_Altitude(&kf);
-              liveTelemetry.kf_velocity_ms = Kalman2State_Velocity(&kf);
+              /* Only read filter outputs once it is live (PAD onward). During
+               * STARTUP the filter is not yet initialised, so log zeros instead
+               * of reading an uninitialised object. (kf is global/zero-init, so
+               * this is belt-and-suspenders — but explicit is safer than relying
+               * on that.)                                                       */
+              if (ao_flight_state == AO_FLIGHT_STARTUP) {
+                  liveTelemetry.kf_altitude_m  = 0.0f;
+                  liveTelemetry.kf_velocity_ms = 0.0f;
+              } else {
+                  liveTelemetry.kf_altitude_m  = Kalman2State_Altitude(&kf);
+                  liveTelemetry.kf_velocity_ms = Kalman2State_Velocity(&kf);
+              }
+
+              /* Surface calibration rejections (board moved / sensor glitch).
+               * Printed once each time the reject counter advances.            */
+              {
+                  static uint32_t prev_rejects = 0;
+                  if (ao_cal_reject_count != prev_rejects) {
+                      prev_rejects = ao_cal_reject_count;
+                      char w[64];
+                      int wn = snprintf(w, sizeof(w),
+                                        "WARN: cal rejected (#%lu) — retrying\r\n",
+                                        (unsigned long)ao_cal_reject_count);
+                      HAL_UART_Transmit(&huart2, (uint8_t *)w, (uint16_t)wn, HAL_MAX_DELAY);
+                  }
+              }
 
               /* Print on state transitions so you can see them on the UART */
               if (prev_state != ao_flight_state) {

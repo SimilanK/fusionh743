@@ -39,6 +39,7 @@
 extern "C" {
 #endif
 
+#include <stdint.h>
 #include "Kalman2State.h"
 
 /* ── State enum (AltOS-aligned names) ───────────────────────────────────────── */
@@ -69,6 +70,24 @@ extern float ao_ground_accel;   /* 1g on the vertical axis measured on the pad [
 #define AO_BOOST_HEIGHT_THRESHOLD   20.0f   /* KF altitude AGL [m]  — AO_M_TO_HEIGHT(20) */
 #define AO_BOOST_ACCEL_THRESHOLD    20.0f   /* net upward accel [m/s²] — AO_MSS_TO_ACCEL */
 #define AO_BOOST_SPEED_THRESHOLD     5.0f   /* KF velocity [m/s]    — AO_MS_TO_SPEED(5)  */
+
+/* ── Calibration sanity bands (mirrors AltOS ao_flight.c startup validation) ──────
+ * If the averaged pad readings fall outside these, calibration is rejected and
+ * STARTUP restarts (accumulators reset). Catches a moving board, an SPI glitch
+ * returning 0/garbage, or a baro blow-out — none of which should ever arm.
+ *
+ * Accel band: expect ~1g (9.81) on the vertical axis. Generous margin allows
+ *   modest pad tilt but rejects 0 / NaN / absurd values. Positive band assumes
+ *   nose-up mounting (az reads +9.81); flip if your axis convention differs.
+ * Height band: AltOS uses [-1000, 7000] m; widened top for high-altitude sites. */
+#define AO_CAL_ACCEL_MIN   7.0f      /* [m/s²] reject if |g_cal| below this  */
+#define AO_CAL_ACCEL_MAX  12.0f      /* [m/s²] reject if g_cal above this    */
+#define AO_CAL_HEIGHT_MIN (-1000.0f) /* [m]    reject baro below this        */
+#define AO_CAL_HEIGHT_MAX  9000.0f   /* [m]    reject baro above this        */
+
+/* Number of consecutive calibration rejections to report (for visibility).
+ * Read by main.c to surface a warning; does not stop retrying.               */
+extern uint32_t ao_cal_reject_count;
 
 /* ── API ─────────────────────────────────────────────────────────────────────── */
 
