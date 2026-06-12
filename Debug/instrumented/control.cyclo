@@ -1,0 +1,10 @@
+../instrumented/control.c:59:6:control_SetEventsForThisBaseStep	1
+../instrumented/control.c:73:13:rate_monotonic_scheduler	2
+../instrumented/control.c:97:15:control_fast_interp	6
+../instrumented/control.c:131:15:control_fast_interp_a	6
+../instrumented/control.c:165:15:control_fast_interp_a2	6
+../instrumented/control.c:199:13:control_RK2	8
+../instrumented/control.c:285:6:control_step0	17
+../instrumented/control.c:434:6:control_step1	11
+../instrumented/control.c:580:6:control_initialize	1
+../instrumented/control.c:666:6:control_terminate	1

@@ -245,7 +245,7 @@ int main(void)
          MS5607_Poll() advances an internal state machine using HAL_GetTick()
          deadlines (no HAL_Delay inside).  Returns 1 when a complete
          pressure+temperature sample is ready.  The next D1 conversion has
-         already been issued before returning, so it overlaps the ICM read,
+         already been issued before returning,\ so it overlaps the ICM read,
          UART write, and SD write that follow.                               */
       if (MS5607_Poll()) {
 

@@ -9,6 +9,7 @@ RM := rm -rf
 
 # All of the sources participating in the build are defined here
 -include sources.mk
+-include instrumented/subdir.mk
 -include STM32CubeIDE/Application/User/Startup/subdir.mk
 -include STM32CubeIDE/Application/User/Core/subdir.mk
 -include Middlewares/Third_Party/FatFs/src/option/subdir.mk
@@ -25,6 +26,14 @@ RM := rm -rf
 -include .claude/worktrees/unruffled-bhabha-cf975e/FATFS/App/subdir.mk
 -include .claude/worktrees/unruffled-bhabha-cf975e/Drivers/STM32H7xx_HAL_Driver/Src/subdir.mk
 -include .claude/worktrees/unruffled-bhabha-cf975e/Core/Src/subdir.mk
+-include .claude/worktrees/elastic-hugle-2aa6b3/STM32CubeIDE/Application/User/Startup/subdir.mk
+-include .claude/worktrees/elastic-hugle-2aa6b3/STM32CubeIDE/Application/User/Core/subdir.mk
+-include .claude/worktrees/elastic-hugle-2aa6b3/Middlewares/Third_Party/FatFs/src/option/subdir.mk
+-include .claude/worktrees/elastic-hugle-2aa6b3/Middlewares/Third_Party/FatFs/src/subdir.mk
+-include .claude/worktrees/elastic-hugle-2aa6b3/FATFS/Target/subdir.mk
+-include .claude/worktrees/elastic-hugle-2aa6b3/FATFS/App/subdir.mk
+-include .claude/worktrees/elastic-hugle-2aa6b3/Drivers/STM32H7xx_HAL_Driver/Src/subdir.mk
+-include .claude/worktrees/elastic-hugle-2aa6b3/Core/Src/subdir.mk
 -include objects.mk
 
 ifneq ($(MAKECMDGOALS),clean)

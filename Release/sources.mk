@@ -22,6 +22,14 @@ C_DEPS :=
 
 # Every subdirectory with source files must be described here
 SUBDIRS := \
+.claude/worktrees/elastic-hugle-2aa6b3/Core/Src \
+.claude/worktrees/elastic-hugle-2aa6b3/Drivers/STM32H7xx_HAL_Driver/Src \
+.claude/worktrees/elastic-hugle-2aa6b3/FATFS/App \
+.claude/worktrees/elastic-hugle-2aa6b3/FATFS/Target \
+.claude/worktrees/elastic-hugle-2aa6b3/Middlewares/Third_Party/FatFs/src \
+.claude/worktrees/elastic-hugle-2aa6b3/Middlewares/Third_Party/FatFs/src/option \
+.claude/worktrees/elastic-hugle-2aa6b3/STM32CubeIDE/Application/User/Core \
+.claude/worktrees/elastic-hugle-2aa6b3/STM32CubeIDE/Application/User/Startup \
 .claude/worktrees/unruffled-bhabha-cf975e/Core/Src \
 .claude/worktrees/unruffled-bhabha-cf975e/Drivers/STM32H7xx_HAL_Driver/Src \
 .claude/worktrees/unruffled-bhabha-cf975e/FATFS/App \
@@ -38,4 +46,5 @@ Middlewares/Third_Party/FatFs/src \
 Middlewares/Third_Party/FatFs/src/option \
 STM32CubeIDE/Application/User/Core \
 STM32CubeIDE/Application/User/Startup \
+instrumented \
 
