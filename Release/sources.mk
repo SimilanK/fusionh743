@@ -46,5 +46,4 @@ Middlewares/Third_Party/FatFs/src \
 Middlewares/Third_Party/FatFs/src/option \
 STM32CubeIDE/Application/User/Core \
 STM32CubeIDE/Application/User/Startup \
-instrumented \
 

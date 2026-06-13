@@ -9,7 +9,6 @@ RM := rm -rf
 
 # All of the sources participating in the build are defined here
 -include sources.mk
--include instrumented/subdir.mk
 -include STM32CubeIDE/Application/User/Startup/subdir.mk
 -include STM32CubeIDE/Application/User/Core/subdir.mk
 -include Middlewares/Third_Party/FatFs/src/option/subdir.mk

@@ -1,0 +1,12 @@
+../Core/Src/mpl3115a2.c:39:19:reg_write	2
+../Core/Src/mpl3115a2.c:46:19:reg_read	2
+../Core/Src/mpl3115a2.c:54:16:ctrl1_base	2
+../Core/Src/mpl3115a2.c:61:19:apply_config	4
+../Core/Src/mpl3115a2.c:72:12:MPL3115A2_Init	3
+../Core/Src/mpl3115a2.c:85:12:MPL3115A2_DataReady	2
+../Core/Src/mpl3115a2.c:93:12:MPL3115A2_ReadAltitude	4
+../Core/Src/mpl3115a2.c:112:12:MPL3115A2_ReadPressure	4
+../Core/Src/mpl3115a2.c:131:12:MPL3115A2_SetOSR	1
+../Core/Src/mpl3115a2.c:136:12:MPL3115A2_SetMode	1
+../Core/Src/mpl3115a2.c:141:12:MPL3115A2_SetSeaLevelPressure	3
+../Core/Src/mpl3115a2.c:150:7:MPL3115A2_AltitudeFromPressure	1

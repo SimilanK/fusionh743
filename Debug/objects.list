@@ -6,6 +6,7 @@
 "./Core/Src/control.o"
 "./Core/Src/control_data.o"
 "./Core/Src/main.o"
+"./Core/Src/mpl3115a2.o"
 "./Core/Src/pseudo_traj.o"
 "./Core/Src/rt_nonfinite.o"
 "./Core/Src/stm32h7xx_hal_msp.o"

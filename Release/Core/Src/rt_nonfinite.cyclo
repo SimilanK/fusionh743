@@ -1,0 +1,4 @@
+../Core/Src/rt_nonfinite.c:32:11:rtIsInf	2
+../Core/Src/rt_nonfinite.c:38:11:rtIsInfF	2
+../Core/Src/rt_nonfinite.c:44:11:rtIsNaN	1
+../Core/Src/rt_nonfinite.c:50:11:rtIsNaNF	1

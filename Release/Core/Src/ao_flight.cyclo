@@ -1,0 +1,2 @@
+../Core/Src/ao_flight.c:36:6:ao_flight_init	1
+../Core/Src/ao_flight.c:46:6:ao_flight_update	16

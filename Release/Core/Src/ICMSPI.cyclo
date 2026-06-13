@@ -1,0 +1,16 @@
+../Core/Src/ICMSPI.c:85:20:cs_high	1
+../Core/Src/ICMSPI.c:84:20:cs_low	1
+../Core/Src/ICMSPI.c:114:16:reg_read	1
+../Core/Src/ICMSPI.c:103:26:reg_write.isra	1
+../Core/Src/ICMSPI.c:159:16:ICM45686_Init	2
+../Core/Src/ICMSPI.c:196:9:ICM45686_DataReady	1
+../Core/Src/ICMSPI.c:203:6:ICM45686_Update	2
+../Core/Src/ICMSPI.c:265:7:ICM45686_GetAccelX_mss	1
+../Core/Src/ICMSPI.c:266:7:ICM45686_GetAccelY_mss	1
+../Core/Src/ICMSPI.c:267:7:ICM45686_GetAccelZ_mss	1
+../Core/Src/ICMSPI.c:268:7:ICM45686_GetGyroX_rads	1
+../Core/Src/ICMSPI.c:269:7:ICM45686_GetGyroY_rads	1
+../Core/Src/ICMSPI.c:270:7:ICM45686_GetGyroZ_rads	1
+../Core/Src/ICMSPI.c:271:7:ICM45686_GetTemperature_C	1
+../Core/Src/ICMSPI.c:273:6:ICM45686_GetRaw	3
+../Core/Src/ICMSPI.c:274:6:ICM45686_GetScaled	2

@@ -25,10 +25,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
-#include "MS5607SPI.h"
+//#include "MS5607SPI.h"
 #include "ICMSPI.h"
 #include "Kalman2State.h"
 #include "ao_flight.h"
+#include "airbrake_app.h"
+#include "mpl3115a2.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -59,6 +61,12 @@ typedef struct {
 #define SERVO_MIN_US   560   /* pulse width (µs) that produces physical  0° */
 #define SERVO_MAX_US  2460   /* pulse width (µs) that produces physical 180° (estimated: symmetric around 1520 µs center) */
 
+/* Sampling rate.  MPL_OSR_1 conversion time is ~6 ms, so a 10 ms gate
+ * always finds a fresh sample.  UART at 115200 baud takes ~7.4 ms per row,
+ * so UART is decimated to UART_DECIMATE:1 (10 Hz) to stay within budget.   */
+#define SAMPLE_PERIOD_MS   10u   /* 100 Hz fixed loop rate                  */
+#define UART_DECIMATE      10u   /* print every Nth sample → 10 Hz on UART  */
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -78,6 +86,7 @@ DMA_HandleTypeDef hdma_spi4_rx;
 DMA_HandleTypeDef hdma_spi4_tx;
 
 TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim6;
 
 UART_HandleTypeDef huart2;
 
@@ -96,6 +105,9 @@ uint8_t sdReady = 0;
 /* Kalman filter instance — passed by pointer to ao_flight_update() every sample.
  * ao_ground_height and ao_ground_accel are now owned by ao_flight.c.           */
 Kalman2State kf;
+
+//i2c baro
+MPL3115A2_t baro;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -109,6 +121,7 @@ static void MX_SPI1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_SDMMC1_SD_Init(void);
 static void MX_SPI4_Init(void);
+static void MX_TIM6_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -154,7 +167,7 @@ int main(void)
 
   /* USER CODE BEGIN SysInit */
 
-  /* USE21q CODE END SysInit */
+  /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
@@ -166,12 +179,17 @@ int main(void)
   MX_SDMMC1_SD_Init();
   MX_FATFS_Init();
   MX_SPI4_Init();
+  MX_TIM6_Init();
   /* USER CODE BEGIN 2 */
   //servo init
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
 
-  //baroinit — now on SPI1 (PA5/6/7) with CS on PA4, matching the working G474 setup
-  MS5607_Init(&hspi1, BARO_CS_GPIO_Port, BARO_CS_Pin);
+  //baroinit —
+  /* OSR_1 (~6 ms conversion) with a 10 ms gate gives fresh data every cycle.
+   * OSR_16 (~66 ms) was capping throughput at ~15 Hz — incompatible with 100 Hz. */
+  if (MPL3115A2_Init(&baro, &hi2c1, MPL_MODE_BAROMETER, MPL_OSR_1) != MPL_OK) {
+      Error_Handler();
+  }
 
   //imu init — SPI4 (PE2/5/6), CS=PE4
   //NOTE: PE4 must be configured as GPIO_Output in CubeMX if not already done
@@ -241,20 +259,14 @@ int main(void)
       /* SD sync counter — flush every 10 rows to avoid per-row stall */
       static uint8_t  syncCount = 0;
 
-      /* ── Non-blocking barometer poll ─────────────────────────────────────
-         MS5607_Poll() advances an internal state machine using HAL_GetTick()
-         deadlines (no HAL_Delay inside).  Returns 1 when a complete
-         pressure+temperature sample is ready.  The next D1 conversion has
-         already been issued before returning,\ so it overlaps the ICM read,
-         UART write, and SD write that follow.                               */
-      if (MS5607_Poll()) {
-
-          /* Timestamp = when D1 was issued (~40 ms earlier than if stamped
-             after blocking MS5607Update() returns).                        */
-          liveTelemetry.timestamp     = MS5607_GetSampleTick();
-          liveTelemetry.pressure_pa   = MS5607GetPressurePa();
-          liveTelemetry.temperature_c = MS5607GetTemperatureC();
-          liveTelemetry.altitude_m    = MS5607GetAltitudeM();
+      /* Baroread                     */
+      float pa, tc;
+      if (MPL3115A2_ReadPressure(&baro, &pa, &tc) == MPL_OK) {
+          liveTelemetry.timestamp      = HAL_GetTick();
+          liveTelemetry.pressure_pa    = pa;
+          liveTelemetry.temperature_c = tc;
+          liveTelemetry.altitude_m     = MPL3115A2_AltitudeFromPressure(pa);
+      }
 
           /* IMU burst-read on SPI4 — no conflict with baro on SPI1.
              The baro D1 conversion runs in the sensor's internal ADC
@@ -386,28 +398,26 @@ int main(void)
                   }
               }
           }
+          /* ── Servo sweep — independent 150 ms cadence ───────────────────────
+             40 steps × 150 ms = 6 s per full sweep, same as the original loop
+             that ran at ~150 ms/iteration due to HAL_Delay(100) + baro blocking.
+             The servo update is now decoupled from the baro data-ready event.  */
+          if (HAL_GetTick() - servoTick >= 150) {
+              servoTick = HAL_GetTick();
+              const float servoMin = 27.0f, servoMax = 140.0f;
+              const float step     = (servoMax - servoMin) / 40.0f;
+              servoPos += servoDir * step;
+              if (servoPos >= servoMax) { servoPos = servoMax; servoDir = -1.0f; }
+              if (servoPos <= servoMin) { servoPos = servoMin; servoDir =  1.0f; }
+              liveTelemetry.servo_deg = servoPos;
+              servoSetAngle(servoPos);
+          }
       }
 
-      /* ── Servo sweep — independent 150 ms cadence ───────────────────────
-         40 steps × 150 ms = 6 s per full sweep, same as the original loop
-         that ran at ~150 ms/iteration due to HAL_Delay(100) + baro blocking.
-         The servo update is now decoupled from the baro data-ready event.  */
-      if (HAL_GetTick() - servoTick >= 150) {
-          servoTick = HAL_GetTick();
-          const float servoMin = 27.0f, servoMax = 140.0f;
-          const float step     = (servoMax - servoMin) / 40.0f;
-          servoPos += servoDir * step;
-          if (servoPos >= servoMax) { servoPos = servoMax; servoDir = -1.0f; }
-          if (servoPos <= servoMin) { servoPos = servoMin; servoDir =  1.0f; }
-          liveTelemetry.servo_deg = servoPos;
-          servoSetAngle(servoPos);
-      }
 
-      /* No HAL_Delay() — loop runs free.
-         Baro rate (~25 Hz) is now set by the MS5607 OSR_4096 conversion time
-         (2 × 20 ms), not by an arbitrary delay.                            */
 
-  }
+
+
   /* USER CODE END 3 */
 }
 
@@ -485,7 +495,7 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.Timing = 0x4040171D;
+  hi2c1.Init.Timing = 0x30B70F24;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
@@ -700,6 +710,44 @@ static void MX_TIM2_Init(void)
 
   /* USER CODE END TIM2_Init 2 */
   HAL_TIM_MspPostInit(&htim2);
+
+}
+
+/**
+  * @brief TIM6 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM6_Init(void)
+{
+
+  /* USER CODE BEGIN TIM6_Init 0 */
+
+  /* USER CODE END TIM6_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM6_Init 1 */
+
+  /* USER CODE END TIM6_Init 1 */
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = 0;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 65535;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM6_Init 2 */
+
+  /* USER CODE END TIM6_Init 2 */
 
 }
 
