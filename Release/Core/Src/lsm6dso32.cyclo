@@ -1,0 +1,5 @@
+../Core/Src/lsm6dso32.c:59:20:reg_read	1
+../Core/Src/lsm6dso32.c:50:20:reg_write	1
+../Core/Src/lsm6dso32.c:71:13:LSM6DSO32_Init	7
+../Core/Src/lsm6dso32.c:112:13:LSM6DSO32_DataReady	2
+../Core/Src/lsm6dso32.c:122:13:LSM6DSO32_Update	6

@@ -26,7 +26,7 @@
 #include <string.h>
 #include <math.h>
 //#include "MS5607SPI.h"
-#include "ICMSPI.h"
+#include "lsm6dso32.h"
 #include "Kalman2State.h"
 #include "ao_flight.h"
 #include "airbrake_app.h"
@@ -61,11 +61,9 @@ typedef struct {
 #define SERVO_MIN_US   560   /* pulse width (µs) that produces physical  0° */
 #define SERVO_MAX_US  2460   /* pulse width (µs) that produces physical 180° (estimated: symmetric around 1520 µs center) */
 
-/* Sampling rate.  MPL_OSR_1 conversion time is ~6 ms, so a 10 ms gate
- * always finds a fresh sample.  UART at 115200 baud takes ~7.4 ms per row,
- * so UART is decimated to UART_DECIMATE:1 (10 Hz) to stay within budget.   */
-#define SAMPLE_PERIOD_MS   10u   /* 100 Hz fixed loop rate                  */
-#define UART_DECIMATE      10u   /* print every Nth sample → 10 Hz on UART  */
+/* 100 Hz fixed output rate.  MPL_OSR_1 conversion time is ~6 ms, so a
+ * 10 ms gate always finds a fresh sample with ~4 ms to spare.            */
+#define SAMPLE_PERIOD_MS   10u
 
 /* USER CODE END PD */
 
@@ -77,16 +75,15 @@ typedef struct {
 /* Private variables ---------------------------------------------------------*/
 
 I2C_HandleTypeDef hi2c1;
+I2C_HandleTypeDef hi2c2;
 
 SD_HandleTypeDef hsd1;
 
-SPI_HandleTypeDef hspi1;
 SPI_HandleTypeDef hspi4;
 DMA_HandleTypeDef hdma_spi4_rx;
 DMA_HandleTypeDef hdma_spi4_tx;
 
 TIM_HandleTypeDef htim2;
-TIM_HandleTypeDef htim6;
 
 UART_HandleTypeDef huart2;
 
@@ -106,8 +103,10 @@ uint8_t sdReady = 0;
  * ao_ground_height and ao_ground_accel are now owned by ao_flight.c.           */
 Kalman2State kf;
 
-//i2c baro
+//i2c baro (I2C1)
 MPL3115A2_t baro;
+//i2c imu (I2C2)
+LSM6DSO32_t imu;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -117,11 +116,10 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_I2C1_Init(void);
-static void MX_SPI1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_SDMMC1_SD_Init(void);
 static void MX_SPI4_Init(void);
-static void MX_TIM6_Init(void);
+static void MX_I2C2_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -174,27 +172,26 @@ int main(void)
   MX_DMA_Init();
   MX_USART2_UART_Init();
   MX_I2C1_Init();
-  MX_SPI1_Init();
   MX_TIM2_Init();
   MX_SDMMC1_SD_Init();
   MX_FATFS_Init();
   MX_SPI4_Init();
-  MX_TIM6_Init();
+  MX_I2C2_Init();
   /* USER CODE BEGIN 2 */
   //servo init
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
 
-  //baroinit —
-  /* OSR_1 (~6 ms conversion) with a 10 ms gate gives fresh data every cycle.
-   * OSR_16 (~66 ms) was capping throughput at ~15 Hz — incompatible with 100 Hz. */
+  //baroinit — OSR_1: ~6 ms conversion, polled every 10 ms (100 Hz)
   if (MPL3115A2_Init(&baro, &hi2c1, MPL_MODE_BAROMETER, MPL_OSR_1) != MPL_OK) {
-      Error_Handler();
+//      Error_Handler();
   }
 
-  //imu init — SPI4 (PE2/5/6), CS=PE4
-  //NOTE: PE4 must be configured as GPIO_Output in CubeMX if not already done
-  //NOTE: SPI4 must be Mode 3 (CPOL=High, CPHA=2Edge) in CubeMX
-  ICM45686_Init(&hspi4, ICM_CS_GPIO_Port, ICM_CS_Pin);
+  //imu init — LSM6DSO32 on I2C2 (SA0/SDO → VDD → address 0x6B)
+  //           ±32g accel, ±2000 dps gyro, 104 Hz ODR
+  if (LSM6DSO32_Init(&imu, &hi2c2, LSM6DSO32_ADDR_6B,
+                     LSM6_ODR_104HZ, LSM6_FS_XL_32G, LSM6_FS_G_2000DPS) != LSM6_OK) {
+      Error_Handler();
+  }
 
   //UART header — two KF columns added at the end (backward compatible: old parsers ignore them)
   const char *uartHeader = "timestamp_ms,pressure_pa,temperature_c,altitude_m,servo_deg,"
@@ -249,106 +246,99 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-      /* dt tracking for Kalman predict step — persists across iterations */
-      static uint32_t prev_timestamp = 0;
+      static uint32_t next_tick    = 0;   /* fixed-rate gate deadline         */
+      static uint32_t prev_ts      = 0;   /* previous sample tick for dt      */
+      static float    servoPos     = 0.0f;
+      static float    servoDir     = 1.0f;
+      static uint32_t servoTick    = 0;
+      static uint8_t  syncCount    = 0;
 
-      /* Servo sweep state — persists across iterations */
-      static float    servoPos  = 0.0f;
-      static float    servoDir  = 1.0f;
-      static uint32_t servoTick = 0;
-      /* SD sync counter — flush every 10 rows to avoid per-row stall */
-      static uint8_t  syncCount = 0;
+      /* ── Fixed 100 Hz gate ───────────────────────────────────────────────── */
+      uint32_t now = HAL_GetTick();
+      if (now < next_tick) continue;
+      next_tick = now + SAMPLE_PERIOD_MS;
 
-      /* Baroread                     */
-      float pa, tc;
-      if (MPL3115A2_ReadPressure(&baro, &pa, &tc) == MPL_OK) {
-          liveTelemetry.timestamp      = HAL_GetTick();
-          liveTelemetry.pressure_pa    = pa;
-          liveTelemetry.temperature_c = tc;
-          liveTelemetry.altitude_m     = MPL3115A2_AltitudeFromPressure(pa);
+      /* Timestamp locked to gate open — uniform 10 ms spacing in the log. */
+      liveTelemetry.timestamp = now;
+
+      /* ── Barometer (MPL3115A2, I2C) ──────────────────────────────────────── */
+      {
+          uint8_t baro_rdy = 0;
+          float pa, tc;
+          MPL3115A2_DataReady(&baro, &baro_rdy);
+          if (baro_rdy && MPL3115A2_ReadPressure(&baro, &pa, &tc) == MPL_OK) {
+              liveTelemetry.pressure_pa   = (int32_t)pa;
+              liveTelemetry.temperature_c = tc;
+              liveTelemetry.altitude_m    = MPL3115A2_AltitudeFromPressure(pa);
+          }
+          /* Not ready: previous values repeat. At OSR_1 (~6 ms) with a 10 ms
+           * gate there is ~4 ms margin; should not occur at steady state.    */
       }
 
-          /* IMU burst-read on SPI4 — no conflict with baro on SPI1.
-             The baro D1 conversion runs in the sensor's internal ADC
-             while the CPU reads the ICM over the separate SPI4 bus.       */
-          ICM45686_Update();
-          liveTelemetry.accel_x_mss = ICM45686_GetAccelX_mss();
-          liveTelemetry.accel_y_mss = ICM45686_GetAccelY_mss();
-          liveTelemetry.accel_z_mss = ICM45686_GetAccelZ_mss();
-          liveTelemetry.gyro_x_rads = ICM45686_GetGyroX_rads();
-          liveTelemetry.gyro_y_rads = ICM45686_GetGyroY_rads();
-          liveTelemetry.gyro_z_rads = ICM45686_GetGyroZ_rads();
-          liveTelemetry.imu_temp_c  = ICM45686_GetTemperature_C();
+      /* ── IMU (LSM6DSO32, I2C2) ──────────────────────────────────────────── */
+      if (LSM6DSO32_Update(&imu) == LSM6_OK) {
+          liveTelemetry.accel_x_mss = imu.accel_x_mss;
+          liveTelemetry.accel_y_mss = imu.accel_y_mss;
+          liveTelemetry.accel_z_mss = imu.accel_z_mss;
+          liveTelemetry.gyro_x_rads = imu.gyro_x_rads;
+          liveTelemetry.gyro_y_rads = imu.gyro_y_rads;
+          liveTelemetry.gyro_z_rads = imu.gyro_z_rads;
+          liveTelemetry.imu_temp_c  = imu.temp_c;
+      }
 
-          /* ── Flight state machine + Kalman filter ──────────────────────────
-           * ao_flight_update() runs the Kalman predict+update internally for
-           * PAD and BOOST states; in STARTUP it accumulates calibration samples.
-           * After the call, read kf outputs and ao_flight_state for logging.
-           *
-           * Vertical axis: az_mss (reads ~+9.81 at rest, nose-up on the pad).
-           * TODO: change to correct axis if board is mounted differently.     */
+      /* ── Flight state machine + Kalman filter ───────────────────────────── */
+      {
+          ao_flight_state_t prev_state = ao_flight_state;
+
+          float dt = (prev_ts > 0) ? (float)(now - prev_ts) / 1000.0f : 0.0f;
+          prev_ts = now;
+
+          ao_flight_update(&kf,
+                           liveTelemetry.accel_z_mss,
+                           dt,
+                           (float)liveTelemetry.altitude_m);
+
+          if (ao_flight_state == AO_FLIGHT_STARTUP) {
+              liveTelemetry.kf_altitude_m  = 0.0f;
+              liveTelemetry.kf_velocity_ms = 0.0f;
+          } else {
+              liveTelemetry.kf_altitude_m  = Kalman2State_Altitude(&kf);
+              liveTelemetry.kf_velocity_ms = Kalman2State_Velocity(&kf);
+          }
+
           {
-              ao_flight_state_t prev_state = ao_flight_state;
-
-              float dt = 0.0f;
-              if (prev_timestamp > 0) {
-                  dt = (float)(liveTelemetry.timestamp - prev_timestamp) / 1000.0f;
-              }
-              prev_timestamp = liveTelemetry.timestamp;
-
-              ao_flight_update(&kf,
-                               liveTelemetry.accel_z_mss,      /* vertical accel  */
-                               dt,                              /* sample period   */
-                               (float)liveTelemetry.altitude_m);/* absolute baro   */
-
-              /* Only read filter outputs once it is live (PAD onward). During
-               * STARTUP the filter is not yet initialised, so log zeros instead
-               * of reading an uninitialised object. (kf is global/zero-init, so
-               * this is belt-and-suspenders — but explicit is safer than relying
-               * on that.)                                                       */
-              if (ao_flight_state == AO_FLIGHT_STARTUP) {
-                  liveTelemetry.kf_altitude_m  = 0.0f;
-                  liveTelemetry.kf_velocity_ms = 0.0f;
-              } else {
-                  liveTelemetry.kf_altitude_m  = Kalman2State_Altitude(&kf);
-                  liveTelemetry.kf_velocity_ms = Kalman2State_Velocity(&kf);
-              }
-
-              /* Surface calibration rejections (board moved / sensor glitch).
-               * Printed once each time the reject counter advances.            */
-              {
-                  static uint32_t prev_rejects = 0;
-                  if (ao_cal_reject_count != prev_rejects) {
-                      prev_rejects = ao_cal_reject_count;
-                      char w[64];
-                      int wn = snprintf(w, sizeof(w),
-                                        "WARN: cal rejected (#%lu) — retrying\r\n",
-                                        (unsigned long)ao_cal_reject_count);
-                      HAL_UART_Transmit(&huart2, (uint8_t *)w, (uint16_t)wn, HAL_MAX_DELAY);
-                  }
-              }
-
-              /* Print on state transitions so you can see them on the UART */
-              if (prev_state != ao_flight_state) {
-                  switch (ao_flight_state) {
-                  case AO_FLIGHT_PAD: {
-                      char msg[80];
-                      int n = snprintf(msg, sizeof(msg),
-                                       "State: PAD  h0=%.2fm  g=%.4fm/s2\r\n",
-                                       (double)ao_ground_height,
-                                       (double)ao_ground_accel);
-                      HAL_UART_Transmit(&huart2, (uint8_t *)msg, (uint16_t)n, HAL_MAX_DELAY);
-                      break;
-                  }
-                  case AO_FLIGHT_BOOST:
-                      HAL_UART_Transmit(&huart2, (uint8_t *)"State: BOOST\r\n", 14, HAL_MAX_DELAY);
-                      break;
-                  default: break;
-                  }
+              static uint32_t prev_rejects = 0;
+              if (ao_cal_reject_count != prev_rejects) {
+                  prev_rejects = ao_cal_reject_count;
+                  char w[64];
+                  int wn = snprintf(w, sizeof(w),
+                                    "WARN: cal rejected (#%lu) — retrying\r\n",
+                                    (unsigned long)ao_cal_reject_count);
+                  HAL_UART_Transmit(&huart2, (uint8_t *)w, (uint16_t)wn, HAL_MAX_DELAY);
               }
           }
 
-          /* UART */
+          if (prev_state != ao_flight_state) {
+              switch (ao_flight_state) {
+              case AO_FLIGHT_PAD: {
+                  char msg[80];
+                  int n = snprintf(msg, sizeof(msg),
+                                   "State: PAD  h0=%.2fm  g=%.4fm/s2\r\n",
+                                   (double)ao_ground_height,
+                                   (double)ao_ground_accel);
+                  HAL_UART_Transmit(&huart2, (uint8_t *)msg, (uint16_t)n, HAL_MAX_DELAY);
+                  break;
+              }
+              case AO_FLIGHT_BOOST:
+                  HAL_UART_Transmit(&huart2, (uint8_t *)"State: BOOST\r\n", 14, HAL_MAX_DELAY);
+                  break;
+              default: break;
+              }
+          }
+      }
+
+      /* ── UART — every sample (10 Hz, within 115200 baud budget) ─────────── */
+      {
           int len = snprintf(uartTxBuffer, sizeof(uartTxBuffer),
                              "%lu,%ld,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.2f,%.3f,%.4f\r\n",
                              liveTelemetry.timestamp,
@@ -368,51 +358,48 @@ int main(void)
           if (len > 0) {
               HAL_UART_Transmit(&huart2, (uint8_t *)uartTxBuffer, (uint16_t)len, HAL_MAX_DELAY);
           }
+      }
 
-          /* SD: write every sample; sync every 10 rows.
-             f_sync on every row can stall the loop for 5-50 ms per call.
-             Batching to every 10 rows keeps the stall rare and bounded.   */
-          if (sdReady) {
-              UINT bw;
-              int sdLen = snprintf(sdWriteBuffer, sizeof(sdWriteBuffer),
-                                   "%lu,%ld,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.2f,%.3f,%.4f\r\n",
-                                   liveTelemetry.timestamp,
-                                   liveTelemetry.pressure_pa,
-                                   liveTelemetry.temperature_c,
-                                   liveTelemetry.altitude_m,
-                                   (double)liveTelemetry.servo_deg,
-                                   (double)liveTelemetry.accel_x_mss,
-                                   (double)liveTelemetry.accel_y_mss,
-                                   (double)liveTelemetry.accel_z_mss,
-                                   (double)liveTelemetry.gyro_x_rads,
-                                   (double)liveTelemetry.gyro_y_rads,
-                                   (double)liveTelemetry.gyro_z_rads,
-                                   (double)liveTelemetry.imu_temp_c,
-                                   (double)liveTelemetry.kf_altitude_m,
-                                   (double)liveTelemetry.kf_velocity_ms);
-              if (sdLen > 0) {
-                  f_write(&LogFile, sdWriteBuffer, (UINT)sdLen, &bw);
-                  if (++syncCount >= 10) {
-                      f_sync(&LogFile);
-                      syncCount = 0;
-                  }
+      /* ── SD — every sample; sync every 10 rows ───────────────────────────── */
+      if (sdReady) {
+          UINT bw;
+          int sdLen = snprintf(sdWriteBuffer, sizeof(sdWriteBuffer),
+                               "%lu,%ld,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.2f,%.3f,%.4f\r\n",
+                               liveTelemetry.timestamp,
+                               liveTelemetry.pressure_pa,
+                               liveTelemetry.temperature_c,
+                               liveTelemetry.altitude_m,
+                               (double)liveTelemetry.servo_deg,
+                               (double)liveTelemetry.accel_x_mss,
+                               (double)liveTelemetry.accel_y_mss,
+                               (double)liveTelemetry.accel_z_mss,
+                               (double)liveTelemetry.gyro_x_rads,
+                               (double)liveTelemetry.gyro_y_rads,
+                               (double)liveTelemetry.gyro_z_rads,
+                               (double)liveTelemetry.imu_temp_c,
+                               (double)liveTelemetry.kf_altitude_m,
+                               (double)liveTelemetry.kf_velocity_ms);
+          if (sdLen > 0) {
+              f_write(&LogFile, sdWriteBuffer, (UINT)sdLen, &bw);
+              if (++syncCount >= 10) {
+                  f_sync(&LogFile);
+                  syncCount = 0;
               }
           }
-          /* ── Servo sweep — independent 150 ms cadence ───────────────────────
-             40 steps × 150 ms = 6 s per full sweep, same as the original loop
-             that ran at ~150 ms/iteration due to HAL_Delay(100) + baro blocking.
-             The servo update is now decoupled from the baro data-ready event.  */
-          if (HAL_GetTick() - servoTick >= 150) {
-              servoTick = HAL_GetTick();
-              const float servoMin = 27.0f, servoMax = 140.0f;
-              const float step     = (servoMax - servoMin) / 40.0f;
-              servoPos += servoDir * step;
-              if (servoPos >= servoMax) { servoPos = servoMax; servoDir = -1.0f; }
-              if (servoPos <= servoMin) { servoPos = servoMin; servoDir =  1.0f; }
-              liveTelemetry.servo_deg = servoPos;
-              servoSetAngle(servoPos);
-          }
       }
+
+      /* ── Servo sweep — independent 150 ms cadence ───────────────────────── */
+      if (now - servoTick >= 150) {
+          servoTick = now;
+          const float servoMin = 27.0f, servoMax = 140.0f;
+          const float step     = (servoMax - servoMin) / 40.0f;
+          servoPos += servoDir * step;
+          if (servoPos >= servoMax) { servoPos = servoMax; servoDir = -1.0f; }
+          if (servoPos <= servoMin) { servoPos = servoMin; servoDir =  1.0f; }
+          liveTelemetry.servo_deg = servoPos;
+          servoSetAngle(servoPos);
+      }
+  }
 
 
 
@@ -528,6 +515,54 @@ static void MX_I2C1_Init(void)
 }
 
 /**
+  * @brief I2C2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C2_Init(void)
+{
+
+  /* USER CODE BEGIN I2C2_Init 0 */
+
+  /* USER CODE END I2C2_Init 0 */
+
+  /* USER CODE BEGIN I2C2_Init 1 */
+
+  /* USER CODE END I2C2_Init 1 */
+  hi2c2.Instance = I2C2;
+  hi2c2.Init.Timing = 0x00B03FDB;
+  hi2c2.Init.OwnAddress1 = 0;
+  hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c2.Init.OwnAddress2 = 0;
+  hi2c2.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Analogue filter
+  */
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c2, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Digital filter
+  */
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c2, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C2_Init 2 */
+
+  /* USER CODE END I2C2_Init 2 */
+
+}
+
+/**
   * @brief SDMMC1 Initialization Function
   * @param None
   * @retval None
@@ -555,54 +590,6 @@ static void MX_SDMMC1_SD_Init(void)
   /* USER CODE BEGIN SDMMC1_Init 2 */
 
   /* USER CODE END SDMMC1_Init 2 */
-
-}
-
-/**
-  * @brief SPI1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_SPI1_Init(void)
-{
-
-  /* USER CODE BEGIN SPI1_Init 0 */
-
-  /* USER CODE END SPI1_Init 0 */
-
-  /* USER CODE BEGIN SPI1_Init 1 */
-
-  /* USER CODE END SPI1_Init 1 */
-  /* SPI1 parameter configuration*/
-  hspi1.Instance = SPI1;
-  hspi1.Init.Mode = SPI_MODE_MASTER;
-  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
-  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_128;
-  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
-  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
-  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-  hspi1.Init.CRCPolynomial = 0x0;
-  hspi1.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
-  hspi1.Init.NSSPolarity = SPI_NSS_POLARITY_LOW;
-  hspi1.Init.FifoThreshold = SPI_FIFO_THRESHOLD_01DATA;
-  hspi1.Init.TxCRCInitializationPattern = SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
-  hspi1.Init.RxCRCInitializationPattern = SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
-  hspi1.Init.MasterSSIdleness = SPI_MASTER_SS_IDLENESS_00CYCLE;
-  hspi1.Init.MasterInterDataIdleness = SPI_MASTER_INTERDATA_IDLENESS_00CYCLE;
-  hspi1.Init.MasterReceiverAutoSusp = SPI_MASTER_RX_AUTOSUSP_DISABLE;
-  hspi1.Init.MasterKeepIOState = SPI_MASTER_KEEP_IO_STATE_ENABLE;
-  hspi1.Init.IOSwap = SPI_IO_SWAP_DISABLE;
-  if (HAL_SPI_Init(&hspi1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN SPI1_Init 2 */
-
-  /* USER CODE END SPI1_Init 2 */
 
 }
 
@@ -714,44 +701,6 @@ static void MX_TIM2_Init(void)
 }
 
 /**
-  * @brief TIM6 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM6_Init(void)
-{
-
-  /* USER CODE BEGIN TIM6_Init 0 */
-
-  /* USER CODE END TIM6_Init 0 */
-
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM6_Init 1 */
-
-  /* USER CODE END TIM6_Init 1 */
-  htim6.Instance = TIM6;
-  htim6.Init.Prescaler = 0;
-  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim6.Init.Period = 65535;
-  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM6_Init 2 */
-
-  /* USER CODE END TIM6_Init 2 */
-
-}
-
-/**
   * @brief USART2 Initialization Function
   * @param None
   * @retval None
@@ -832,47 +781,17 @@ static void MX_GPIO_Init(void)
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOE_CLK_ENABLE();
-  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(ICM_CS_GPIO_Port, ICM_CS_Pin, GPIO_PIN_SET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(BARO_CS_GPIO_Port, BARO_CS_Pin, GPIO_PIN_SET);
-
-  /*Configure GPIO pin : ICM_CS_Pin */
-  GPIO_InitStruct.Pin = ICM_CS_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-  HAL_GPIO_Init(ICM_CS_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : ICM_INT1_Pin */
-  GPIO_InitStruct.Pin = ICM_INT1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(ICM_INT1_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : BARO_CS_Pin */
-  GPIO_InitStruct.Pin = BARO_CS_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(BARO_CS_GPIO_Port, &GPIO_InitStruct);
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /*Configure GPIO pin : SD_DETECT_Pin */
   GPIO_InitStruct.Pin = SD_DETECT_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(SD_DETECT_GPIO_Port, &GPIO_InitStruct);
-
-  /* EXTI interrupt init*/
-  HAL_NVIC_SetPriority(ICM_INT1_EXTI_IRQn, 5, 0);
-  HAL_NVIC_EnableIRQ(ICM_INT1_EXTI_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 

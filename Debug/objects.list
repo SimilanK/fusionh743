@@ -5,6 +5,7 @@
 "./Core/Src/ao_flight.o"
 "./Core/Src/control.o"
 "./Core/Src/control_data.o"
+"./Core/Src/lsm6dso32.o"
 "./Core/Src/main.o"
 "./Core/Src/mpl3115a2.o"
 "./Core/Src/pseudo_traj.o"

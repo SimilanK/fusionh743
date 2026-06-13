@@ -1,0 +1,5 @@
+../.claude/worktrees/unruffled-bhabha-cf975e/FATFS/Target/sd_diskio.c:210:9:SD_ioctl	6
+../.claude/worktrees/unruffled-bhabha-cf975e/FATFS/Target/sd_diskio.c:180:9:SD_write	3
+../.claude/worktrees/unruffled-bhabha-cf975e/FATFS/Target/sd_diskio.c:132:9:SD_status	2
+../.claude/worktrees/unruffled-bhabha-cf975e/FATFS/Target/sd_diskio.c:149:9:SD_read	3
+../.claude/worktrees/unruffled-bhabha-cf975e/FATFS/Target/sd_diskio.c:109:9:SD_initialize	2
