@@ -181,18 +181,39 @@ int main(void)
   //servo init
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
 
-  //baroinit — OSR_1: ~6 ms conversion, polled every 10 ms (100 Hz)
-  if (MPL3115A2_Init(&baro, &hi2c1, MPL_MODE_BAROMETER, MPL_OSR_1) != MPL_OK) {
-//      Error_Handler();
+  /* Give I2C sensors time to reach operational state after power-up. */
+  HAL_Delay(50);
+
+  /* ── Barometer init (MPL3115A2, I2C1) ──────────────────────────────────── */
+  {
+      char dbg[56];
+      HAL_UART_Transmit(&huart2, (uint8_t *)"Baro init...\r\n", 14, HAL_MAX_DELAY);
+      MPL_Status r = MPL3115A2_Init(&baro, &hi2c1, MPL_MODE_BAROMETER, MPL_OSR_1);
+      if (r != MPL_OK) {
+          /* code 1=I2C bus fault (address/wiring), 2=wrong WHO_AM_I */
+          int n = snprintf(dbg, sizeof(dbg), "BARO FAIL code=%d\r\n", (int)r);
+          HAL_UART_Transmit(&huart2, (uint8_t *)dbg, (uint16_t)n, HAL_MAX_DELAY);
+          Error_Handler();
+      }
+      HAL_UART_Transmit(&huart2, (uint8_t *)"Baro OK\r\n", 9, HAL_MAX_DELAY);
   }
 
-  //imu init — LSM6DSO32 on I2C2 (SA0/SDO → VDD → address 0x6B)
-  //           ±32g accel, ±2000 dps gyro, 104 Hz ODR
-  if (LSM6DSO32_Init(&imu, &hi2c2, LSM6DSO32_ADDR_6B,
-                     LSM6_ODR_104HZ, LSM6_FS_XL_32G, LSM6_FS_G_2000DPS) != LSM6_OK) {
-      Error_Handler();
+  /* ── IMU init (LSM6DSO32, I2C2) ────────────────────────────────────────── */
+  /* Default address 0x6B (SA0/SDO → VDD on Adafruit breakout).
+   * If FAIL code=1, try LSM6DSO32_ADDR_6A (SA0 → GND).                     */
+  {
+      char dbg[56];
+      HAL_UART_Transmit(&huart2, (uint8_t *)"IMU init...\r\n", 13, HAL_MAX_DELAY);
+      LSM6_Status r = LSM6DSO32_Init(&imu, &hi2c2, LSM6DSO32_ADDR_6A,
+                                      LSM6_ODR_104HZ, LSM6_FS_XL_32G, LSM6_FS_G_2000DPS);
+      if (r != LSM6_OK) {
+          /* code 1=I2C bus fault (address/wiring/I2C2 config), 2=wrong WHO_AM_I */
+          int n = snprintf(dbg, sizeof(dbg), "IMU FAIL code=%d\r\n", (int)r);
+          HAL_UART_Transmit(&huart2, (uint8_t *)dbg, (uint16_t)n, HAL_MAX_DELAY);
+          Error_Handler();
+      }
+      HAL_UART_Transmit(&huart2, (uint8_t *)"IMU OK\r\n", 8, HAL_MAX_DELAY);
   }
-
   //UART header — two KF columns added at the end (backward compatible: old parsers ignore them)
   const char *uartHeader = "timestamp_ms,pressure_pa,temperature_c,altitude_m,servo_deg,"
                             "ax_mss,ay_mss,az_mss,gx_rads,gy_rads,gz_rads,imu_temp_c,"
@@ -360,8 +381,13 @@ int main(void)
           }
       }
 
-      /* ── SD — every sample; sync every 10 rows ───────────────────────────── */
-      if (sdReady) {
+      /* ── SD — one row per unique tick; sync every 10 rows ───────────────── */
+      /* Guard against f_sync stalls: if sync takes >10 ms the gate has
+       * already expired when we return.  last_sd_ts prevents a duplicate
+       * row being written on the catch-up iteration with the same 'now'.  */
+      static uint32_t last_sd_ts = UINT32_MAX;
+      if (sdReady && now != last_sd_ts) {
+          last_sd_ts = now;
           UINT bw;
           int sdLen = snprintf(sdWriteBuffer, sizeof(sdWriteBuffer),
                                "%lu,%ld,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.2f,%.3f,%.4f\r\n",

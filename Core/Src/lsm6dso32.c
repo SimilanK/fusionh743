@@ -8,6 +8,10 @@
 #include "lsm6dso32.h"
 #include <math.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 /* ── Register map (datasheet Table 17) ─────────────────────────────────── */
 #define REG_WHO_AM_I   0x0F
 #define REG_CTRL1_XL   0x10   /* accel ODR + FS                             */
